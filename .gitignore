@@ -1,0 +1,28 @@
+# Build directories (CMake and xmake output)
+build/
+cmake-build-*/
+.xmake/
+out/
+
+# Local IDE state (CLion / Visual Studio). Not part of the library.
+.idea/
+.vs/
+.vscode/
+*.user
+*.suo
+
+# Compiler and linker output, including spike binaries and anything
+# dropped in the repository root by a one-off compile.
+*.exe
+*.o
+*.obj
+*.a
+*.lib
+*.pdb
+*.ilk
+*.exp
+
+# CMake files that are machine-local when generated outside a build dir
+CMakeUserPresets.json
+CMakeCache.txt
+CMakeFiles/
