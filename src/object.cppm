@@ -513,10 +513,10 @@ private:
  * @brief Whether `arg` (always an lvalue view) can bind to a parameter
  * @param parameter The parameter's exact type (references and cv preserved)
  * @param decay     The parameter's remove_cvref type; must be arg's type
- * @param explicit_choice Whether the caller picked this exact callable (a
- *        Method / Constructor handle) rather than leaving the choice to the
- *        library. Only then may a `T&&` parameter take the argument, because
- *        ObjectRef has no value category and the call moves from it.
+ * @param explicit_choice Whether the caller picked this exact callable. Only then
+ *        may a `T&&` parameter take the argument, because ObjectRef has no value
+ *        category and the call moves from it. A Method, Constructor, or Function
+ *        handle is an explicit choice; Class::new_instance is not.
  *
  * Rules: a const argument cannot bind to a non-const reference; `T&&` needs
  * `explicit_choice`; by-value and `const T&` accept any argument of the type.
@@ -2878,6 +2878,18 @@ struct Access
 
     template<typename Handle, typename Desc>
     [[nodiscard]] static constexpr auto make(const Desc* desc) noexcept -> Handle { return Handle(desc); }
+
+    /// Adopts a thunk's heap result. The handles' from_raw / descriptor constructors stay private.
+    [[nodiscard]] static auto adopt_object(void* data, const TypeDescriptor* desc) noexcept -> Object
+    {
+        return Object::from_raw(data, desc);
+    }
+
+    [[nodiscard]] static auto view_object(const void* data, const TypeDescriptor* desc, bool is_const,
+                                          bool is_volatile) noexcept -> ObjectRef
+    {
+        return ObjectRef(data, desc, is_const, is_volatile);
+    }
 };
 
 inline auto accepts_argument(const Class* parameter, const TypeDescriptor* decay,
@@ -2945,7 +2957,7 @@ inline auto argument_mismatch(std::string_view callee, std::size_t index, const 
     }
     else if (!explicit_choice)
     {
-        rule = "an rvalue-reference parameter is only selectable through a Method / Constructor handle";
+        rule = "an rvalue-reference parameter is only selectable through a Method, Constructor, or Function handle";
     }
 
     return Error{ErrorKind::TypeMismatch,

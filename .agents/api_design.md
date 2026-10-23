@@ -596,6 +596,88 @@ public:
   （带 `DELETED`，不可 `invoke`）；C 可变参数函数（只列固定形参，不可 `invoke`）。
   **不列**：构造函数（见 Constructor）、其余特殊成员、函数模板（含 deducing this 的模板）、
   非模板的显式对象成员函数（`void f(this C&)`，形参表无法如实表达）。
+  自由函数不是成员，不在这张表里，见 §6.1。
+
+## 6.1 自由函数：`Function`
+
+命名空间作用域的函数没有类可以挂。入口是用户点名的那一个函数，不枚举命名空间，也不做 ADL。
+
+```cpp
+class Function {
+public:
+    std::string_view get_name() const;
+    std::string_view get_namespace() const;            // 全局命名空间为空
+    std::string_view get_qualified_name() const;       // "my_ns::inner::scale"
+    const Class& get_return_type() const;              // void 也有 Class
+    std::span<const Class* const> get_parameter_types() const;
+    std::size_t get_parameter_count() const;
+    Modifier modifiers() const;                        // 只有 NOEXCEPT / DELETED；没有访问级别
+
+    Outcome<Object> invoke(Args args = {}) const;     // 无接收者
+    Outcome<ObjectRef> invoke_ref(Args args = {}) const;
+
+    bool is_noexcept() const;
+    bool is_deleted() const;
+    bool is_operator() const;
+    bool is_variadic() const;                          // C 可变参数；只列固定形参
+    bool is_invokable() const;
+    bool returns_reference() const;
+    bool is_ref_invokable() const;
+    bool has_canonical_name() const;                   // false：static / 匿名命名空间，不进 for_name
+
+    std::string_view get_signature() const;            // for_name 的键，见下
+
+    std::span<const Annotation> get_annotations() const;
+    template <typename T> Option<const T&> get_annotation() const;
+    std::span<const Annotation> get_parameter_annotations(std::size_t index) const;
+    template <typename T> Option<const T&> get_parameter_annotation(std::size_t index) const;
+
+    bool operator==(const Function&) const noexcept;  // 同一次声明即相等
+
+    static Option<const Function&> for_name(std::string_view signature);
+    static std::vector<std::string_view> registered_signatures();
+};
+
+template <auto Token>
+const Function& function_of();
+
+// 重载消歧：按形参类型选出函数指针，再交给 function_of。
+// C 可变参数（...）用第二份。noexcept 函数也能绑到第一份，反射结果仍是原来的 noexcept 函数。
+template <typename... Params, typename R>
+consteval R (*overload_of(R& fn))(Params...);                 // fn 的类型是 R(Params...)
+template <typename... Params, typename R>
+consteval R (*overload_of(R& fn))(Params..., ...);            // fn 的类型是 R(Params..., ...)
+```
+
+点名方式（GCC 16.2：`reflect_function` 只能作用在函数指针常量上，不能作用在函数参数上，所以入口是非类型模板参数）：
+
+```cpp
+const Function& add = speculo::function_of<my_ns::add>();          // 名字唯一；写 &my_ns::add 相同
+const Function& scale = speculo::function_of<speculo::overload_of<int, int>(my_ns::scale)>();
+const Function& same = speculo::function_of<^^my_ns::add>();       // 与上一行 add 是同一个函数
+
+int left = 2;
+int right = 3;
+Object sum = add.invoke({ left, right }).unwrap();
+```
+
+规则：
+
+- 实参检查与 `Method::invoke` 相同：个数不符 → `InvalidArgument`；类型不符 → `TypeMismatch`；
+  只做精确匹配。`T&&` 形参因为调用方已经点名了这个 `Function`，可以接受，并按右值转发。
+- 返回值装箱与 `Method` 相同：`void` 得到空 `Object`；`T&` 的 `invoke` 拷贝 referent（不可拷贝 →
+  `NotSupported`），`invoke_ref` 给出 referent 的视图。
+- 不补默认实参。形参表是声明里的全部形参，调用时个数必须一致。
+- C 可变参数、按值传递不可拷贝形参：句柄在，`invoke` / `invoke_ref` 为 `NotSupported`。
+- **`= delete` 的自由函数点不了名**。GCC 16.2 把 `^^f` 放进模块模板的非类型参数时会 odr-use 这个函数，已删除的函数因此直接编不过。成员函数里的 `= delete` 仍由类的成员表列出（那条路径不取地址）。
+- 函数模板本身不反射。点名一个已经实例化的特化（`function_of<my_ns::id<int>>()`）可以。
+- 成员函数（含静态成员函数）不从这里进，用 `Class::get_method`。
+- `get_signature()` 是编译器的 `display_string`，`noexcept` 函数再接上 `" noexcept"`
+  （display 串本身不含 noexcept）。`for_name` 只认这串，不做空白规范化。
+- 有规范名的函数在 `function_of` 时自动注册。`static` 和匿名命名空间里的函数
+  `has_canonical_name()` 为 false：可以 `invoke`，`for_name` 查不到。
+- 不支持：命名空间枚举、ADL、命名空间作用域变量、`consteval` 函数（GCC 16.2 没有
+  `is_consteval`，点名可能直接编不过）。
 
 ## 7. ctor 分区：`Constructor`
 
@@ -742,7 +824,8 @@ scale.get_parameter_annotation<Tag>(0).unwrap();
 | 基类说明 | `BaseClass` | 可以。这是**这条基类关系**上的注解，不是基类类型自己的 `Class::get_annotations()` |
 | 函数形参 | `Method` / `Constructor` 的 `get_parameter_annotations(i)` | 可以 |
 | typedef / using 别名 | 不暴露 | `^^Alias` 在 meta 层看得到，但 `class_of` 把别名折叠成底层类型，注解随之丢失（与 design §11「别名直接解析到底层类型」一致） |
-| 自由函数、命名空间、命名空间作用域变量 | 不做 | meta 看得到，本库没有这些句柄 |
+| 自由函数 | `Function` | 可以。点名 `function_of`，不从命名空间枚举。GCC 16.2 上 `= delete` 的自由函数点不了名 |
+| 命名空间、命名空间作用域变量 | 不做 | meta 看得到，本库没有这些句柄 |
 | `[[nodiscard]]`、`[[deprecated]]` 等普通 attribute | 不暴露 | `annotations_of` 不返回它们。attribute 和注解也不能写进同一个 `[[ ]]`，要分成 `[[nodiscard]] [[= 1]]` |
 
 不继承：派生类的 `get_annotations()` 不含基类上的注解，也不含基类成员上的注解。要看基类自己的，先 `get_bases()` / `get_superclass()` 再查。
@@ -829,6 +912,12 @@ static std::vector<std::string_view> Class::registered_names();
 // 显式注册（提前注册 / “只按名字用、从不 class_of<T>”的类型）
 void register_class(const Class& cls);            // 幂等；同名冲突后者忽略并返回（设计取舍，初版简单）
 
+// 自由函数按签名注册（function_of 首次调用时自动做）。键是 Function::get_signature()，
+// 不是函数名：重载共享名字。无规范名者不注册。幂等，同键后者忽略。
+void register_function(const Function& fn);
+static Option<const Function&> Function::for_name(std::string_view signature);
+static std::vector<std::string_view> Function::registered_signatures();
+
 }
 
 // 头内宏（用于“只按名字用”的类型，建议在类型定义处调用；Phase 6 已落地）
@@ -891,6 +980,7 @@ s.get_class();   // → class_of<Circle>()（动态类型）
 | `Class` | get_name/get_simple_name/get_fields/get_declared_fields/get_methods/get_method/get_constructors/new_instance/get_superclass/is_assignable_from/is_instance/is_enum/is_array/is_interface(modifier) | get_size/get_alignment/get_pointee_type/get_element_type/get_array_extent/get_array_rank/get_unqualified_type/is_const_qualified/is_volatile_qualified/get_underlying_type/get_enumerators/enum_from_name/enum_from_value/enum_name_of/is_union/is_polymorphic/is_abstract/is_final/is_aggregate/kind/get_bases/cast_to/get_static_field；get_method/get_constructor/get_field 提供三种查找路径：**模板重载**（编译期物化、最快）、`Class*` 运行期重载、**类型名**（`string_view`）运行期重载 |
 | `Field` | get_name/get_type/get_declaring_class/get/set/modifiers | get_size/get_alignment/get_offset/get_bit_offset/is_bitfield/get_bit_width/is_mutable/is_reference/get_ref |
 | `Method` | get_name/get_return_type/get_parameter_types/invoke/modifiers | is_const/is_volatile/get_ref_qualifier/is_noexcept/is_virtual/is_pure_virtual/is_override/is_destructor/is_operator/get_signature |
+| `Function`（§6.1，Java 无对应） | get_name/get_return_type/get_parameter_types/invoke/modifiers/for_name | get_namespace/get_qualified_name/get_signature/is_noexcept/is_deleted/is_operator/is_variadic/invoke_ref；入口 `function_of` / `overload_of` |
 | `Constructor` | get_parameter_types/new_instance/modifiers | is_default_constructor/is_copy_constructor/is_move_constructor/is_explicit/is_deleted/is_defaulted/construct_at/destroy_at/get_signature |
 | `Modifier` | PUBLIC/PROTECTED/PRIVATE/STATIC/FINAL/ABSTRACT/INTERFACE | CONST/VOLATILE/VIRTUAL/EXPLICIT/NOEXCEPT/CONSTEXPR/CONSTEVAL/MUTABLE/BITFIELD/REFERENCE/DEFAULTED/DELETED/OVERRIDE/INLINE |
 | `Array` | new_instance/get_length/get/set | get_ref/get_element_type（含数组 Class 的 rank/extent） |

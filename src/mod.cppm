@@ -7,6 +7,7 @@ export import :error;
 export import :modifier;
 export import :descriptor;
 export import :object;
+export import :function;
 export import :registry;
 
 export namespace speculo

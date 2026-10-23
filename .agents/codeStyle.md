@@ -169,12 +169,14 @@ export import :error;
 export import :modifier;
 export import :descriptor;
 export import :object;
+export import :function;
+export import :registry;
 ```
 
 - Module partition names are single lowercase words (`error`, `modifier`,
-  `descriptor`, `object`), matching @.agents/design.md §4 and the actual
-  partition layout (see @.agents/review.md "Phase 3" for why `:type` / `:field` /
-  `:method` converge into `:object`).
+  `descriptor`, `object`, `function`, `registry`), matching @.agents/design.md §4
+  and the actual partition layout (see @.agents/review.md "Phase 3" for why
+  `:type` / `:field` / `:method` converge into `:object`).
 - Put public API in `export namespace speculo { ... }`. Internal implementation
   details go in namespace `speculo::detail` (never exported from the umbrella
   module), matching @.agents/design.md §3.

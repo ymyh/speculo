@@ -49,12 +49,14 @@ consteval auto m = materialize<T>()  ==>   cls.get_field("x").get(obj)
 ```
 ┌─────────────────────────────────────────────┐
 │ API 层      Class / Field / Method /         │  ← 用户直接接触，均为只读句柄
-│             Constructor / Modifier / Array   │
+│             Constructor / Function /         │
+│             Modifier / Array                 │
 ├─────────────────────────────────────────────┤
 │ 对象层      Object（owning）/ ObjectRef      │  ← 类型擦除的值与引用
 ├─────────────────────────────────────────────┤
 │ 描述层      TypeDescriptor / FieldDesc /     │  ← constexpr 静态表，内部细节
-│             MethodDesc / CtorDesc / EnumDesc │
+│             MethodDesc / FunctionDesc /      │
+│             CtorDesc / EnumDesc              │
 ├─────────────────────────────────────────────┤
 │ thunk 层    getter/setter/invoker/ctor/dtor  │  ← 编译期生成的类型擦除函数指针
 ├─────────────────────────────────────────────┤
@@ -76,13 +78,15 @@ GCC 模块依赖规则（详见 @.agents/review.md「Phase 3」偏差 1）收敛
 | `speculo.modifier` | `Modifier`（Java 风格位掩码工具类）、`RefQualifier`、`TypeKind` |
 | `speculo.descriptor` | 描述层结构体（`TypeDescriptor`/`FieldDesc`/`MethodDesc`/...）与 thunk ABI（内部） |
 | `speculo.object` | `Object` / `ObjectRef` / `Args` / `Class` / `Field` / `Method` / `Constructor`（Phase 3/4） |
+| `speculo.function` | `Function` / `function_of` / `overload_of`（自由函数，点名物化） |
 | ~~`speculo.ctor`~~ | `Constructor` 已并入 `speculo.object`（模块分区拆分限制，见 review.md Phase 3/4 偏差） |
 | ~~`speculo.array`~~ | `Array` 已并入 `speculo.object`（沿用「不拆模块分区」约束，见 review.md Phase 5 偏差 4-8） |
-| `speculo.registry` | 名字 → `Class` 的全局注册表，`Class::for_name`（Phase 6） |
+| `speculo.registry` | 名字 → `Class`、签名 → `Function` 的全局注册表，`Class::for_name` / `Function::for_name` |
 | `speculo`（主接口） | `export import` 以上所有分区 + 入口函数 `class_of<T>()` |
 
-内部实现（物化逻辑、thunk 生成）放 `speculo::detail`（见 `src/object.cppm` 内的
-`module; #include <meta>` 全局模块片段 + `detail` 命名空间）。
+内部实现（物化逻辑、thunk 生成）放 `speculo::detail`（见 `src/object.cppm` 与
+`src/function.cppm` 内的 `module; #include <meta>` 全局模块片段 + `detail` 命名空间）。
+`:function` 依赖 `:object`，`:registry` 再依赖 `:function`，避免分区环。
 
 ## 5. 对象模型与生命周期
 
@@ -128,15 +132,18 @@ Java 里一切皆堆对象、有 GC；C++ 不行，因此区分两种类型擦�
 
 私有成员的物化依赖 `access_context::unchecked()`（或 GCC 16 提供的等价能力）。若 GCC 16 的实现对私有成员的 splice/extract 仍有限制，则 `get_declared_xxx` 退化为仅返回可访问成员，并在文档与 `review.md` 中记录偏差。**这是本项目最大的实现风险点**，第一阶段就要用 spike 验证。
 
-## 8. 注册表与 `Class::for_name`
+## 8. 注册表与 `Class::for_name` / `Function::for_name`
 
 静态反射以类型为入口，没有“按字符串取类型”的天然能力，因此提供显式注册表：
 
 - `class_of<T>()` 首次调用时自动把 `T` 注册进全局表（qualified name → descriptor 指针）。
 - 另提供 `SPECULO_REGISTER(T)` 宏应对“只按名字查找、从不 `class_of<T>()`”的场景。
 - `Class::for_name("ns::Foo") -> Option<const Class&>`。
-- 注册表运行期只增不改。实现：注册表为**函数内 magic static**（首次访问才构造，天然线程安全），
-  用 `std::shared_mutex` 保护；`class_of<T>()` 内挂一个 `register_once<T>` 的 magic static，保证每类型只注册一次。
+- 自由函数没有类型这个根，不能枚举。`function_of<f>()` 首次调用时按**签名**注册
+  （`Function::get_signature()` → descriptor 指针）；`Function::for_name` 用这串签名查。
+  没人点过名的函数不在表里。
+- 两张表都是运行期只增不改。实现：各自为**函数内 magic static**（首次访问才构造，天然线程安全），
+  用 `std::shared_mutex` 保护；`class_of<T>()` / `function_of<f>()` 内各挂一个 magic static，保证每个实体只注册一次。
   描述表自身仍保持只读、纯 `constexpr`，注册只是其外的一次性副作用。
   （§10「零运行时初始化成本」指描述表物化；注册表是唯一的可变全局状态，见 §8/§10。）
 
@@ -177,7 +184,8 @@ speculo/
 │   ├── modifier.cppm
 │   ├── descriptor.cppm
 │   ├── object.cppm     # Object/ObjectRef/Args/Class/Field/Method/Constructor + 物化
-│   └── registry.cppm   # 名字 → Class（Phase 6）
+│   ├── function.cppm   # Function / function_of / overload_of（自由函数）
+│   └── registry.cppm   # 名字 → Class，签名 → Function
 ├── tests/
 └── examples/
     └── proxy_demo.cpp  # proxy 库集成示例（Phase 7）
@@ -187,8 +195,8 @@ speculo/
 
 - 物化发生在编译期/首次取静态局部时（magic static，C++11 起线程安全）。
 - 所有描述表 const，`Class`/`Field` 等句柄无内部状态，任意线程并发只读安全。
-- 唯一的可变全局状态是注册表，见 §8。
-- `Method::invoke` 等热路径 = 一次 `Args` 类型检查 + 一次函数指针调用 + 返回值打包；不做字符串比较（重载解析按 `Class` 指针比较）。
+- 唯一的可变全局状态是两张注册表（类型名、函数签名），见 §8。
+- `Method::invoke` / `Function::invoke` 等热路径 = 一次 `Args` 类型检查 + 一次函数指针调用 + 返回值打包；不做字符串比较（重载解析按 `Class` 指针比较）。
 - 三级查找策略按速度递减：`get_method<Params...>(name)`（编译期物化参数指针数组，运行期纯指针比较）> `get_method(name, {&cls...})`（运行期指针比较）> `get_method(name, {"type_name"...})`（注册表字符串解析后再指针比较）。热路径应优先用模板重载。
 
 ## 11. 限制与已知边界
@@ -205,3 +213,10 @@ speculo/
    这会实例化其函数体。若某特化的成员函数体对其自身无效（典型：`Option<move-only T>::or_` 内 `return *this;`
    需要拷贝），物化即硬错误。故 `SPECULO_IMPL` 注入的 `get_class()` 用注解排除（见 §10.1），避免把整个
    `Class` 的签名闭包拖进来；直接 `class_of<crab_cpp::Option<Object>>()` 仍会失败。用户应只反射自己的类型。
+9. **自由函数是点名入口，不挂在 `Class` 上**。`function_of<f>()` 物化用户点名的那一个非成员函数；
+   重载用 `function_of<overload_of<形参...>(f)>()` 消歧。不枚举命名空间，不做 ADL，不补默认实参，
+   不反射函数模板本身（点名一个具体特化可以）。`function_of<^^f>()` 与 `function_of<f>()` 是同一个函数。
+   GCC 16.2 上 `= delete` 的自由函数不能点名：把 `^^f` 传入模块模板会 odr-use 它。
+   成员函数里的 `= delete` 仍由类的成员表列出。内部链接（`static`、匿名命名空间）可以 `invoke`，
+   但不进 `Function::for_name`。`consteval` 函数没有可用的 `<meta>` 谓词，点名可能直接编不过。
+   成员函数仍走 `Method`。

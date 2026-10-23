@@ -143,6 +143,37 @@ struct MethodDesc
 };
 
 /**
+ * @brief Runtime description of one namespace-scope function
+ *
+ * There is no declaring class. `signature` is the registry key: the compiler's
+ * display string, plus " noexcept" when the function is noexcept (the display
+ * string itself omits it).
+ */
+struct FunctionDesc
+{
+    std::string_view name;
+    std::string_view namespace_name; ///< empty at global scope
+    std::string_view qualified_name; ///< namespace::name, or just the name
+    std::string_view signature;
+    const TypeDescriptor* return_type = nullptr;
+    const Class* const* parameter_types = nullptr;
+    const TypeDescriptor* const* parameter_decays = nullptr;
+    std::size_t parameter_count = 0;
+    std::uint32_t modifiers = 0; ///< NOEXCEPT / DELETED only
+    bool is_operator = false;
+    bool is_variadic = false;         ///< C-style `...`; only the fixed parameters are listed
+    bool has_canonical_name = false;  ///< false for internal linkage: invokable, not registered
+
+    InvokeFn invoke = nullptr;        ///< self is ignored; nullptr when the call cannot be made
+    InvokeRefFn invoke_ref = nullptr; ///< reference-returning functions only
+
+    const void* annotations = nullptr; ///< const Annotation[]
+    std::size_t annotation_count = 0;
+    const void* parameter_annotations = nullptr; ///< const Annotation* const[] , one span per parameter
+    const std::size_t* parameter_annotation_counts = nullptr;
+};
+
+/**
  * @brief Runtime description of one constructor
  */
 struct CtorDesc

@@ -4,6 +4,7 @@ import std;
 import crab_cpp;
 import :error;
 import :object;
+import :function;
 
 namespace speculo::detail
 {
@@ -12,10 +13,10 @@ namespace speculo::detail
  * @brief The global name table: qualified name -> canonical Class handle
  *
  * A function-local magic static, so it is constructed on first use (thread-safe
- * since C++11) and destroyed at program exit. It is the only mutable global
- * state in speculo (see @.agents/design.md §8 / §10); all descriptor tables
- * remain read-only. A shared mutex allows concurrent readers while a writer
- * registers a class.
+ * since C++11) and destroyed at program exit. The class table and the function
+ * table are the only mutable global state in speculo (see @.agents/design.md §8);
+ * all descriptor tables remain read-only. A shared mutex allows concurrent
+ * readers while a writer registers a class.
  */
 struct ClassRegistry
 {
@@ -23,10 +24,26 @@ struct ClassRegistry
     std::unordered_map<std::string_view, const Class*> classes;
 };
 
+/**
+ * @brief Signature -> Function. Same lifetime rules as ClassRegistry.
+ * The key is Function::get_signature(), which lives in the read-only descriptor.
+ */
+struct FunctionRegistry
+{
+    std::shared_mutex mutex;
+    std::unordered_map<std::string_view, const Function*> functions;
+};
+
 /// The one registry instance (magic static: built on first access).
 [[nodiscard]] inline auto class_registry() -> ClassRegistry&
 {
     static ClassRegistry registry;
+    return registry;
+}
+
+[[nodiscard]] inline auto function_registry() -> FunctionRegistry&
+{
+    static FunctionRegistry registry;
     return registry;
 }
 
@@ -62,6 +79,24 @@ void register_class(const Class& cls)
     // and the library's (what users can write). First registration of a key wins.
     registry.classes.try_emplace(cls.get_qualified_name(), canonical);
     registry.classes.try_emplace(cls.get_normalized_name(), canonical);
+}
+
+/**
+ * @brief Registers a free function under its signature (definition of the
+ *        declaration in speculo:function)
+ * @note Idempotent. Internal-linkage functions are skipped: they can be invoked
+ *       through function_of, but the signature is not a stable cross-TU key.
+ */
+void register_function(const Function& fn)
+{
+    if (!fn.has_canonical_name())
+    {
+        return;
+    }
+
+    detail::FunctionRegistry& registry = detail::function_registry();
+    const std::unique_lock<std::shared_mutex> lock(registry.mutex);
+    registry.functions.try_emplace(fn.get_signature(), std::addressof(fn));
 }
 
 } // namespace speculo
@@ -127,6 +162,39 @@ auto Class::registered_names() -> std::vector<std::string_view>
 
     std::ranges::sort(names);
     return names;
+}
+
+/**
+ * @brief Looks up a free function by the exact get_signature() string
+ */
+auto Function::for_name(std::string_view signature) -> Option<const Function&>
+{
+    detail::FunctionRegistry& registry = detail::function_registry();
+    const std::shared_lock<std::shared_mutex> lock(registry.mutex);
+
+    const auto found = registry.functions.find(signature);
+    if (found == registry.functions.end())
+    {
+        return None{};
+    }
+
+    return *found->second;
+}
+
+auto Function::registered_signatures() -> std::vector<std::string_view>
+{
+    detail::FunctionRegistry& registry = detail::function_registry();
+    const std::shared_lock<std::shared_mutex> lock(registry.mutex);
+
+    std::vector<std::string_view> signatures;
+    signatures.reserve(registry.functions.size());
+    for (const auto& entry : registry.functions)
+    {
+        signatures.push_back(entry.first);
+    }
+
+    std::ranges::sort(signatures);
+    return signatures;
 }
 
 } // namespace speculo

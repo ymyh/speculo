@@ -284,3 +284,18 @@ Phase 2 与 Phase 1 可部分并行（基础层不依赖反射）；Phase 3 是�
 - [ ] README.md（可选）：快速上手 + 构建说明
 
 **验收**：双构建系统全绿；示例能跑；文档与实现一致。
+
+---
+
+## 自由函数（`Function`，P7 期间补充）
+
+**目标**：给命名空间作用域函数一个独立入口，不塞进 `Method`，也不枚举命名空间。
+
+- [x] `Function` 句柄 + `FunctionDesc`（`speculo:function` 分区）
+- [x] `function_of<f>()` / `function_of<^^f>()` / `overload_of<形参...>(f)`
+- [x] `invoke` / `invoke_ref`，实参规则与 `Method` 相同，无接收者
+- [x] 按 `get_signature()` 注册，`Function::for_name`
+- [x] 测试：重载、noexcept、可变参数、引用返回、注解、内部链接不注册（`= delete` 的自由函数在 GCC 16.2 上点不了名）
+
+设计见 @.agents/design.md §8 / §11.9 与 @.agents/api_design.md §6.1。
+

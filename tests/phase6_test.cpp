@@ -183,6 +183,9 @@ TEST(RegistryTest, RegisteredNamesListsBothSpellingsSorted)
 
 TEST(RegistryTest, ParameterTypeNamesUseTheSameSpellings)
 {
+    // Independent of test order: method lookup resolves parameter names through
+    // the global type registry, so materialize the name this test relies on.
+    (void)speculo::class_of<unsigned long long>();
     const speculo::Class& cls = speculo::class_of<p6::Wide>();
 
     // `unsigned long long` is how it is written, not how GCC prints it.
@@ -600,11 +603,47 @@ TEST(StdLibraryTest, StdTypesKeepIdentityWithoutMembers)
 
 TEST(StdLibraryTest, AnonymousUnionMembersAreReflectable)
 {
-    // The members of an anonymous union live on the (unnamed) union type, which is
-    // listed as one unnamed field of the enclosing class.
+    // The anonymous union is one unnamed field of the enclosing class. Its members
+    // are not injected into that class; they are fields of the union type.
     const speculo::Class& cls = speculo::class_of<p6c::Anon>();
     EXPECT_EQ(cls.get_fields().size(), 2u);
     EXPECT_EQ(cls.get_field("tag").unwrap().get_offset(), 0u);
+    EXPECT_TRUE(cls.get_field("as_int").is_none());
+    EXPECT_TRUE(cls.get_field("as_float").is_none());
+
+    speculo::Option<speculo::Field> union_field = speculo::None{};
+    for (const speculo::Field& field : cls.get_fields())
+    {
+        if (field.get_type().is_union())
+        {
+            union_field = field;
+            break;
+        }
+    }
+    ASSERT_TRUE(union_field.is_some());
+
+    const speculo::Field anon = union_field.unwrap();
+    EXPECT_FALSE(anon.get_name().empty());
+    EXPECT_EQ(anon.get_offset(), sizeof(int));
+
+    const speculo::Class& union_type = anon.get_type();
+    EXPECT_TRUE(union_type.is_union());
+    EXPECT_FALSE(union_type.is_class());
+    EXPECT_EQ(union_type.get_fields().size(), 2u);
+
+    const speculo::Field as_int = union_type.get_field("as_int").unwrap();
+    const speculo::Field as_float = union_type.get_field("as_float").unwrap();
+    EXPECT_EQ(as_int.get_declaring_class(), union_type);
+    EXPECT_EQ(as_int.get_type(), speculo::class_of<int>());
+    EXPECT_EQ(as_float.get_type(), speculo::class_of<float>());
+    EXPECT_EQ(as_int.get_offset(), 0u);
+    EXPECT_EQ(as_float.get_offset(), 0u);
+
+    p6c::Anon value{};
+    value.as_int = 7;
+    const speculo::ObjectRef sub = anon.get_ref(value).unwrap();
+    EXPECT_EQ(sub.type(), union_type);
+    EXPECT_EQ(as_int.get(sub).unwrap().as<int>().unwrap(), 7);
 }
 
 // ---------------------------------------------------------------------------
