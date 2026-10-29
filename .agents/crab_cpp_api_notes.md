@@ -21,11 +21,11 @@
 - **speculo 适配**：凡是“具名（lvalue）的 `Outcome<Object>`/`Option<Object>`”上调 `unwrap()` 取 move-only 值的地方，
   改为 `std::move(x).unwrap()`。已改动：
   - `examples/02_construct_and_call.cpp`：`clone()` 结果先 `std::move(cloned).unwrap()` 取出再打印（同时去掉误用的 gtest `ASSERT_TRUE`）。
-  - `tests/phase2_test.cpp`：`std::move(made/cloned).unwrap()`；`ObjectTest.MakeAndTake` 的析构计数改用
+  - `tests/object_test.cpp`：`std::move(made/cloned).unwrap()`；`ObjectTest.MakeAndTake` 的析构计数改用
     `taken.as_ref().unwrap().value` 读取（避免 lvalue `unwrap()` 多拷一份 `Counter`）。
-  - `tests/phase3_test.cpp`：`read` / `bumped` / `invoked` / `result`（两处 `Method::invoke`）改为 `std::move(...).unwrap()`。
-  - `tests/phase4_test.cpp`：`scaled` / `made` / `result` 改 `std::move(...).unwrap()`。
-  - `tests/phase5_test.cpp`：`by_name` / `by_value` / `recovered` / `boxed` / 两个 `Array::new_instance` 的 `made` /
+  - `tests/field_test.cpp` / `tests/method_test.cpp`：`read` / `bumped` / `invoked` / `result`（两处 `Method::invoke`）改为 `std::move(...).unwrap()`。
+  - `tests/args_test.cpp` / `tests/constructor_test.cpp` / `tests/method_test.cpp`：`scaled` / `made` / `result` 改 `std::move(...).unwrap()`。
+  - `tests/enumerator_test.cpp` / `tests/array_test.cpp`：`by_name` / `by_value` / `recovered` / `boxed` / 两个 `Array::new_instance` 的 `made` /
     `empty` 改 `std::move(...).unwrap()`。
 - `api_design.md §0` 注释由 `// owning result (unwrap() is an lvalue)` 改为
   `// rvalue unwrap() moves the Object out`（示例去掉多余 `std::move`）。

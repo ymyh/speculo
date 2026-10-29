@@ -148,8 +148,9 @@ Phase 2 与 Phase 1 可部分并行（基础层不依赖反射）；Phase 3 是�
 - `src/error.cppm`(`speculo:error`) / `src/modifier.cppm`(`:modifier`) / `src/descriptor.cppm`(`:descriptor`) /
   `src/object.cppm`(`:object`，**最大**，含全部 API + 反射物化) / `src/registry.cppm`(`:registry`，名字表 +
   `Class::for_name` + 自动注册钩子) / `src/mod.cppm`（伞模块）。
-- `tests/`：`skeleton_test.cpp`（P0 导入链路）、`phase2_test.cpp`、`phase3_test.cpp`（P3 + 继承导航）、
-  `phase4_test.cpp`（P4）、`phase5_test.cpp`（P5）、`phase6_test.cpp`（P6 注册表 / 名字查找 / 宏 / 并发）。
+- `tests/`：按功能分文件（`error_test.cpp` / `object_test.cpp` / `class_test.cpp` / `field_test.cpp` /
+  `method_test.cpp` / `constructor_test.cpp` / `inheritance_test.cpp` / `array_test.cpp` / `registry_test.cpp` 等），
+  共享 fixture 在 `tests/support/`；完整清单与旧 phase 文件的对应关系见 `tests/README.md`。
 - `registry.cppm` 依赖 `:object`（**不可反向**）：`Class::for_name` 在 `:object` 声明、`:registry` 定义；
   `class_of<T>()`（在 `:object`）经 `detail::register_type`（`:object` 声明、`:registry` 定义）自动注册。
 - `object.cppm` 内部顺序：`export namespace speculo`（FixedString/ObjectRef/Object/Args/Field/Method/BaseClass/
