@@ -22,6 +22,8 @@ class Method;
 class Constructor;
 class Enumerator;
 class Array;
+class TemplateArgument;
+class Callable;
 
 /**
  * @brief Structural string usable as a non-type template parameter
@@ -117,6 +119,8 @@ private:
     friend class Enumerator;
     friend class Class;
     friend class Array;
+    friend class Callable;
+    friend class TemplateArgument;
     friend struct detail::Access;
 
     /// Internal descriptor-based constructor.
@@ -181,6 +185,20 @@ public:
         requires std::is_constructible_v<std::remove_cvref_t<T>, CtorArgs...>
     [[nodiscard]] static auto make(CtorArgs&&... args) -> Outcome<Object>;
 
+    /**
+     * @brief Aggregate-initializes a value and boxes it (`T{values...}`)
+     * @tparam T An aggregate type (cv / references are stripped)
+     * @note The compile-time counterpart of `Class::new_aggregate`: no
+     *       reflection, no run-time matching, and bit-fields / array members
+     *       work as the language allows them to.
+     */
+    template<typename T, typename... Ts>
+        requires std::is_aggregate_v<std::remove_cvref_t<T>>
+    [[nodiscard]] static auto make_aggregate(Ts&&... values) -> Outcome<Object>
+    {
+        return from_value(std::remove_cvref_t<T>{ std::forward<Ts>(values)... });
+    }
+
     /// Deep-copies the boxed value through the descriptor's clone thunk.
     [[nodiscard]] auto clone() const -> Outcome<Object>
     {
@@ -240,6 +258,8 @@ private:
     friend class Enumerator;
     friend class Class;
     friend class Array;
+    friend class TemplateArgument;
+    friend class Callable;
     friend struct detail::Access;
 
     /// Adopts an existing heap allocation (internal).
@@ -540,6 +560,43 @@ private:
 
 /// `(double, int)`: the argument types, for lookup failures that cannot name one parameter.
 [[nodiscard]] auto describe_arguments(const Args& args) -> std::string;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Two-type predicates (api_design §5.2)
+//
+// `std::is_layout_compatible`, `std::is_pointer_interconvertible_base_of` and
+// the two conversion traits need *both* types at compile time. A runtime
+// `const Class&` cannot be turned back into a template argument (there is no
+// RTTI), and the set of type pairs is not enumerable while materializing, so
+// these four stay compile-time functions: the public API below takes both types
+// as template arguments.
+// ─────────────────────────────────────────────────────────────────────────────
+
+template<typename A, typename B>
+consteval auto layout_compatible_types() -> bool
+{
+    return std::meta::is_layout_compatible_type(^^A, ^^B);
+}
+
+/// Note the operand order: `std::meta` (like `std::is_pointer_interconvertible_base_of`)
+/// takes (base, derived), while the public function takes (derived, base).
+template<typename Derived, typename Base>
+consteval auto pointer_interconvertible_types() -> bool
+{
+    return std::meta::is_pointer_interconvertible_base_of_type(^^Base, ^^Derived);
+}
+
+template<typename From, typename To>
+consteval auto convertible_types() -> bool
+{
+    return std::meta::is_convertible_type(^^From, ^^To);
+}
+
+template<typename From, typename To>
+consteval auto nothrow_convertible_types() -> bool
+{
+    return std::meta::is_nothrow_convertible_type(^^From, ^^To);
+}
 
 } // namespace speculo::detail
 
@@ -1093,8 +1150,9 @@ struct MemberQualifiers
 
 /**
  * @brief One direct base class (Java {@code Class#getSuperclass} generalization)
- * @note No offset is exposed: virtual bases have no constant offset; pointer
- *       adjustment goes through Class::cast_to (Phase 5).
+ * @note Base offsets are only exposed for non-virtual bases: a virtual base has
+ *       no constant offset (see @.agents/api_design.md §6), so pointer
+ *       adjustment there still goes through Class::cast_to.
  */
 struct BaseClass
 {
@@ -1105,10 +1163,33 @@ struct BaseClass
     /// nullptr when the base is not accessible (protected/private).
     detail::UpcastFn cast = nullptr;
 
+    /// Byte offset from the derived object's start to this base subobject.
+    /// nullptr for virtual bases (no static offset) and inaccessible bases.
+    detail::BaseOffsetFn offset = nullptr;
+
     const Annotation* annotations = nullptr;
     std::size_t annotation_count = 0;
 
     [[nodiscard]] auto is_virtual() const noexcept -> bool { return modifiers.is_virtual(); }
+
+    /**
+     * @brief Byte offset of this base subobject inside the derived object
+     * @return Some(offset) for non-virtual, accessible bases; None for virtual
+     *         bases (their offset varies with the complete object) and for
+     *         protected / private bases.
+     * @note The offset is computed while materializing (from
+     *       `std::meta::offset_of` on the base reflection), so the thunk folds
+     *       to a constant -- there is nothing to compute at run time.
+     */
+    [[nodiscard]] auto get_offset() const -> Option<std::size_t>
+    {
+        if (offset == nullptr)
+        {
+            return None{};
+        }
+
+        return offset();
+    }
 
     [[nodiscard]] auto get_annotations() const -> std::span<const Annotation>
     {
@@ -1408,6 +1489,103 @@ struct MemberHit
 
 export namespace speculo
 {
+
+/**
+ * @brief One template argument of a class or function template specialization
+ *        (Java erases generics; this is C++-only information)
+ *
+ * Obtained from `Class::get_template_arguments()` / `Function::get_template_arguments()`.
+ * One `kind()` selects the meaningful accessor; the other three return `None`
+ * (or an empty span for `as_pack()`).
+ *
+ * @note Parameter packs are flattened by the reflection layer, so one pack
+ *       argument shows up as several independent arguments and `Kind::Pack` is
+ *       never produced by GCC 16.2 (see @.agents/api_design.md §1.2).
+ */
+class TemplateArgument
+{
+public:
+    using Kind = TemplateArgumentKind;
+
+    constexpr TemplateArgument() noexcept = default;
+
+    [[nodiscard]] auto kind() const -> Kind { return m_desc->kind; }
+
+    /// Kind::Type only: the argument type (`std::vector<int>` -> `int`).
+    [[nodiscard]] auto as_type() const -> Option<const Class&>
+    {
+        if (m_desc->kind != Kind::Type)
+        {
+            return None{};
+        }
+
+        return *m_desc->type->self;
+    }
+
+    /**
+     * @brief Kind::Value only: the non-type argument, boxed as its own type
+     * @note `std::array<int, 3>` boxes an `unsigned long long` holding 3 (the
+     *       argument's declared type, exactly as the compiler spells it).
+     *       None when the kind differs or when the value cannot be extracted on
+     *       this compiler (pointer / member-pointer arguments).
+     */
+    [[nodiscard]] auto as_value() const -> Option<Object>
+    {
+        if (m_desc->kind != Kind::Value || m_desc->value == nullptr || m_desc->type == nullptr
+            || m_desc->type->clone == nullptr)
+        {
+            return None{};
+        }
+
+        return Object::from_raw(m_desc->type->clone(m_desc->value), m_desc->type->decayed);
+    }
+
+    /// Kind::Template only: the template-template argument's primary template.
+    [[nodiscard]] auto as_template() const -> Option<const Class&>
+    {
+        if (m_desc->kind != Kind::Template || m_desc->primary_template == nullptr)
+        {
+            return None{};
+        }
+
+        return *m_desc->primary_template->self;
+    }
+
+    /// Kind::Pack only (never produced by GCC 16.2): the pack's arguments.
+    [[nodiscard]] auto as_pack() const -> std::span<const TemplateArgument>
+    {
+        if (m_desc->kind != Kind::Pack)
+        {
+            return {};
+        }
+
+        return std::span<const TemplateArgument>(static_cast<const TemplateArgument*>(m_desc->pack),
+                                                 m_desc->pack_count);
+    }
+
+    /// The compiler's spelling: `int` / `3` / `std::vector` / `Config{7, 9}`.
+    [[nodiscard]] auto get_spelling() const -> std::string_view { return m_desc->spelling; }
+
+    [[nodiscard]] auto operator==(const TemplateArgument& other) const noexcept -> bool
+    {
+        return m_desc == other.m_desc;
+    }
+
+    [[nodiscard]] auto operator!=(const TemplateArgument& other) const noexcept -> bool
+    {
+        return m_desc != other.m_desc;
+    }
+
+private:
+    friend struct detail::Access;
+
+    explicit constexpr TemplateArgument(const detail::TemplateArgDesc* desc) noexcept
+        : m_desc(desc)
+    {
+    }
+
+    detail::CheckedDesc<detail::TemplateArgDesc> m_desc;
+};
 
 /**
  * @brief Runtime handle describing one type (Java {@code java.lang.Class})
@@ -2217,6 +2395,203 @@ public:
         return ObjectRef(found, base.descriptor(), obj.is_const(), obj.is_volatile());
     }
 
+    // ── Type-system structure: templates, function types, aggregates, nesting ──
+    // (v2, @.agents/api_design.md §1–§4)
+
+    /**
+     * @brief Whether this type is an instance of a class template
+     * @return true for `std::vector<int>`; false for ordinary classes, pointers,
+     *         arrays, and cv-qualified or reference types (`const std::vector<int>`
+     *         is a cv-qualified type, not a specialization -- query the
+     *         unqualified type through get_unqualified_type()).
+     */
+    [[nodiscard]] auto is_template_specialization() const -> bool { return m_desc->primary_template != nullptr; }
+
+    /**
+     * @brief The primary template this type was instantiated from
+     * @return Some(template) with `kind() == TypeKind::Template`; None for
+     *         non-specializations
+     * @note A primary template has a declaration-level descriptor: name only,
+     *       size / alignment 0, and empty member tables (its members' types
+     *       depend on the arguments, so there is nothing to materialize).
+     */
+    [[nodiscard]] auto get_primary_template() const -> Option<const Class&>
+    {
+        if (m_desc->primary_template == nullptr)
+        {
+            return None{};
+        }
+
+        return *m_desc->primary_template->self;
+    }
+
+    /// Template arguments in declaration order, defaulted arguments included
+    /// (`std::vector<int>` has two: `int` and `std::allocator<int>`). Empty for
+    /// non-specializations.
+    [[nodiscard]] auto get_template_arguments() const -> std::span<const TemplateArgument>
+    {
+        return std::span<const TemplateArgument>(static_cast<const TemplateArgument*>(m_desc->template_arguments),
+                                                 m_desc->template_argument_count);
+    }
+
+    /// The argument at `index` when it is a *type* argument; None when the index
+    /// is out of range or the argument is of another kind.
+    [[nodiscard]] auto get_template_argument_type(std::size_t index) const -> Option<const Class&>
+    {
+        const std::span<const TemplateArgument> arguments = get_template_arguments();
+        if (index >= arguments.size() || arguments[index].kind() != TemplateArgumentKind::Type)
+        {
+            return None{};
+        }
+
+        return arguments[index].as_type();
+    }
+
+    // ── Function types (api_design §2.2) ──
+
+    /// The return type of a function type; None unless `kind() == TypeKind::Function`.
+    [[nodiscard]] auto get_return_type() const -> Option<const Class&>
+    {
+        if (m_desc->function_return == nullptr)
+        {
+            return None{};
+        }
+
+        return *m_desc->function_return->self;
+    }
+
+    /// The declared parameter types of a function type (`...` is not a parameter);
+    /// empty unless `kind() == TypeKind::Function`.
+    [[nodiscard]] auto get_parameter_types() const -> std::span<const Class* const>
+    {
+        return std::span<const Class* const>(m_desc->function_parameters, m_desc->function_parameter_count);
+    }
+
+    /// The number of fixed parameters of a function type; 0 for other types.
+    [[nodiscard]] auto get_parameter_count() const -> std::size_t { return m_desc->function_parameter_count; }
+
+    /// Whether a function type takes C-style `...`; false for other types.
+    [[nodiscard]] auto is_variadic() const -> bool { return m_desc->function_is_variadic; }
+
+    /// Whether a function type is `noexcept`; false for other types.
+    [[nodiscard]] auto is_noexcept() const -> bool { return m_desc->function_is_noexcept; }
+
+    // ── Aggregate construction (api_design §3) ──
+
+    /**
+     * @brief Constructs an object by aggregate initialization (`T{a, b, c}`)
+     * @param args One argument per initializer slot: public bases in declaration
+     *             order first, then this class's non-static data members in
+     *             declaration order
+     * @return NotSupported when the type is not an aggregate, or when some slot
+     *         cannot be initialized from a value (protected / private base, array
+     *         or rvalue-reference member, union); InvalidArgument for a
+     *         wrong argument count; TypeMismatch for a mismatched argument
+     * @note Default member initializers are not simulated: every slot must be
+     *       given (see @.agents/api_design.md §3.2).
+     */
+    [[nodiscard]] auto new_aggregate(Args args = {}) const -> Outcome<Object>
+    {
+        if (!is_aggregate() || m_desc->aggregate_initializer == nullptr)
+        {
+            return Error{ErrorKind::NotSupported,
+                         std::format("Class::new_aggregate({}): the type is not an aggregate, or a base / member "
+                                     "cannot be initialized from a value",
+                                     get_qualified_name())};
+        }
+
+        return aggregate_initializer().new_instance(std::move(args));
+    }
+
+    /**
+     * @brief A pseudo constructor describing the aggregate initialization slots
+     * @return Some(constructor) whose parameter list is the initializer list
+     *         (public bases first, then non-static data members); None when the
+     *         type is not an aggregate, or a slot cannot be initialized
+     * @note It is a real Constructor handle: new_instance() / construct_at() /
+     *       destroy_at() behave exactly like new_aggregate().
+     */
+    [[nodiscard]] auto get_aggregate_initializer() const -> Option<Constructor>
+    {
+        if (m_desc->aggregate_initializer == nullptr)
+        {
+            return None{};
+        }
+
+        return aggregate_initializer();
+    }
+
+    // ── Nested types (api_design §4) ──
+
+    /// The classes, unions and enums declared inside this type, in declaration
+    /// order (own declarations only; inherited names are not included). Type
+    /// aliases and uninstantiated member class templates are skipped, and the
+    /// access level of each nested type is its own `modifiers()`.
+    [[nodiscard]] auto get_declared_classes() const -> std::span<const Class* const>
+    {
+        return std::span<const Class* const>(m_desc->nested_types, m_desc->nested_type_count);
+    }
+
+    /// The class this type is declared in; None at namespace scope.
+    [[nodiscard]] auto get_enclosing_class() const -> Option<const Class&>
+    {
+        if (m_desc->enclosing_class == nullptr)
+        {
+            return None{};
+        }
+
+        return *m_desc->enclosing_class->self;
+    }
+
+    // ── Layout and capability predicates (api_design §5) ──
+    //
+    // Every predicate is evaluated while the type is materialized and stored as
+    // one bit; a query is a bit test. Non-class types answer false (they never
+    // panic). The four predicates that need *both* types at compile time are free
+    // function templates instead (see below the class), because a runtime
+    // `const Class&` cannot be turned back into a template argument.
+
+    [[nodiscard]] auto is_trivially_copyable() const -> bool
+    {
+        return detail::has_capability(m_desc->capabilities, detail::Capability::TriviallyCopyable);
+    }
+
+    [[nodiscard]] auto is_trivially_default_constructible() const -> bool
+    {
+        return detail::has_capability(m_desc->capabilities, detail::Capability::TriviallyDefaultConstructible);
+    }
+
+    [[nodiscard]] auto is_trivially_destructible() const -> bool
+    {
+        return detail::has_capability(m_desc->capabilities, detail::Capability::TriviallyDestructible);
+    }
+
+    /// Whether deleting through a pointer to this class runs the derived destructor.
+    [[nodiscard]] auto has_virtual_destructor() const -> bool
+    {
+        return detail::has_capability(m_desc->capabilities, detail::Capability::VirtualDestructor);
+    }
+
+    [[nodiscard]] auto is_standard_layout() const -> bool
+    {
+        return detail::has_capability(m_desc->capabilities, detail::Capability::StandardLayout);
+    }
+
+    [[nodiscard]] auto has_unique_object_representations() const -> bool
+    {
+        return detail::has_capability(m_desc->capabilities, detail::Capability::UniqueObjectRepresentations);
+    }
+
+    /**
+     * @brief Library-synthesized: same size and both trivially copyable
+     * @note There is no standard trait for this; it is the condition for
+     *       `std::bit_cast` in both directions.
+     */
+    [[nodiscard]] auto is_bit_castable_to(const Class& other) const -> bool
+    {
+        return m_desc->size == other.m_desc->size && is_trivially_copyable() && other.is_trivially_copyable();
+    }
+
     [[nodiscard]] auto operator==(const Class& other) const noexcept -> bool { return m_desc == other.m_desc; }
     [[nodiscard]] auto operator!=(const Class& other) const noexcept -> bool { return m_desc != other.m_desc; }
 
@@ -2599,6 +2974,12 @@ private:
     /// The backing descriptor (materialization layer only).
     [[nodiscard]] auto descriptor() const noexcept -> const detail::TypeDescriptor* { return m_desc.get(); }
 
+    /// The pseudo constructor handle stored in the descriptor (non-null when set).
+    [[nodiscard]] auto aggregate_initializer() const -> Constructor
+    {
+        return *static_cast<const Constructor*>(m_desc->aggregate_initializer);
+    }
+
     explicit constexpr Class(const detail::TypeDescriptor* descriptor) noexcept
         : m_desc(descriptor)
     {
@@ -2606,6 +2987,52 @@ private:
 
     detail::CheckedDesc<detail::TypeDescriptor> m_desc;
 };
+
+// ── Two-type predicates (api_design §5.2) ──
+//
+// Unlike the single-type predicates above, these four need both types as
+// *compile-time* operands, so they are free function templates rather than
+// member functions: `class_of<A>().is_layout_compatible<B>()` could only work if
+// the handle knew `A`, which a runtime handle does not. See
+// @.agents/api_design.md §5.2 and @.agents/review.md「Phase 9」.
+
+/**
+ * @brief Whether two standard-layout types can be read through each other
+ * @note Same answer as `std::is_layout_compatible_v<A, B>`.
+ */
+template<typename A, typename B>
+    requires (std::is_class_v<A> || std::is_union_v<A>) && (std::is_class_v<B> || std::is_union_v<B>)
+[[nodiscard]] consteval auto is_layout_compatible() -> bool
+{
+    return detail::layout_compatible_types<A, B>();
+}
+
+/**
+ * @brief Whether a base subobject is pointer-interconvertible with the object
+ * @note Same answer as `std::is_pointer_interconvertible_base_of_v<Base, Derived>`;
+ *       the operand order here is (derived, base), matching `get_bases()`.
+ */
+template<typename Derived, typename Base>
+    requires std::is_class_v<Derived> && std::is_class_v<Base>
+[[nodiscard]] consteval auto is_pointer_interconvertible_with() -> bool
+{
+    return detail::pointer_interconvertible_types<Derived, Base>();
+}
+
+/// Whether `From` converts to `To` implicitly (same as `std::is_convertible_v`).
+template<typename From, typename To>
+[[nodiscard]] consteval auto is_convertible_to() -> bool
+{
+    return detail::convertible_types<From, To>();
+}
+
+/// Whether `From` converts to `To` implicitly and without throwing anything
+/// (same as `std::is_nothrow_convertible_v`).
+template<typename From, typename To>
+[[nodiscard]] consteval auto is_nothrow_convertible_to() -> bool
+{
+    return detail::nothrow_convertible_types<From, To>();
+}
 
 /**
  * @brief Dynamic operations on C-style arrays (Java {@code java.lang.reflect.Array})
@@ -2818,6 +3245,236 @@ private:
         char* base = const_cast<char*>(static_cast<const char*>(array.raw_data()));
         return base + index * element->size;
     }
+};
+
+/**
+ * @brief A callable *value*: a function pointer or a member function pointer
+ *
+ * `Field::get()` on a field holding `void (*)(int)` boxes the pointer in an
+ * `Object`, which offers no way to call it. `Callable::of()` turns such a value
+ * into a handle that can: argument matching, result boxing and virtual dispatch
+ * (a member function pointer called through the object dispatches virtually)
+ * match `Method::invoke`.
+ *
+ * @note Only bare function pointers and member function pointers are handled;
+ *       lambdas / `std::function` would need type information the library does
+ *       not have (no RTTI).
+ */
+class Callable
+{
+public:
+    constexpr Callable() noexcept = default;
+
+    /**
+     * @brief Views a value whose type is a function pointer or member pointer
+     * @return Some(callable) for such a value, None for anything else (and for a
+     *         null reference)
+     */
+    [[nodiscard]] static auto of(ObjectRef value) -> Option<Callable>
+    {
+        if (value.is_null() || value.descriptor() == nullptr || value.descriptor()->callable == nullptr)
+        {
+            return None{};
+        }
+
+        return Callable(*value.descriptor()->callable, value);
+    }
+
+    /// The pointer type itself, e.g. `void (*)(int)` or `void (C::*)(int)`.
+    [[nodiscard]] auto get_type() const -> const Class& { return *m_desc->type->self; }
+
+    /// The function type behind the pointer, e.g. `void (int)`; use
+    /// `get_return_type()` / `get_parameter_types()` on it for the signature.
+    [[nodiscard]] auto get_function_type() const -> const Class& { return *m_desc->function_type->self; }
+
+    [[nodiscard]] auto is_member_function_pointer() const -> bool { return m_desc->is_member_function_pointer; }
+
+    /// The class a member function pointer points into; None for free functions.
+    [[nodiscard]] auto get_declaring_class() const -> Option<const Class&>
+    {
+        if (m_desc->declaring_class == nullptr)
+        {
+            return None{};
+        }
+
+        return *m_desc->declaring_class->self;
+    }
+
+    [[nodiscard]] auto returns_reference() const -> bool
+    {
+        return m_desc->function_type->function_return != nullptr
+            && m_desc->function_type->function_return->reference_kind != RefQualifier::None;
+    }
+
+    /// Whether invoke() can run this value (false when the result cannot be boxed).
+    [[nodiscard]] auto is_invokable() const -> bool { return m_desc->invoke != nullptr; }
+
+    /// Whether invoke_ref() can run this value (reference results only).
+    [[nodiscard]] auto is_ref_invokable() const -> bool { return m_desc->invoke_ref != nullptr; }
+
+    /**
+     * @brief Calls a free function pointer, boxing the result
+     * @return Ok(boxed result); an empty Object for a void function
+     * @note NotSupported when this is a member function pointer (use the
+     *       two-argument overload).
+     */
+    [[nodiscard]] auto invoke(Args args = {}) const -> Outcome<Object>
+    {
+        return box_impl("Callable::invoke", ObjectRef{}, args);
+    }
+
+    /**
+     * @brief Calls a member function pointer on `self`
+     * @param self An object of the pointer's declaring class (exact type; the
+     *             handle does not adjust a derived object's pointer)
+     * @return Ok(boxed result); NotSupported for a free function pointer
+     */
+    [[nodiscard]] auto invoke(ObjectRef self, Args args) const -> Outcome<Object>
+    {
+        return box_impl("Callable::invoke", self, args);
+    }
+
+    /// Calls the pointer and views the referent of a reference result (no copy).
+    [[nodiscard]] auto invoke_ref(Args args = {}) const -> Outcome<ObjectRef>
+    {
+        return ref_impl("Callable::invoke_ref", ObjectRef{}, args);
+    }
+
+    /// @copydoc invoke_ref(Args) const
+    [[nodiscard]] auto invoke_ref(ObjectRef self, Args args) const -> Outcome<ObjectRef>
+    {
+        return ref_impl("Callable::invoke_ref", self, args);
+    }
+
+    /// Same pointer type and the same pointer *value* (byte compare). Two handles
+    /// over different storage holding the same function are equal.
+    [[nodiscard]] auto operator==(const Callable& other) const noexcept -> bool
+    {
+        if (m_desc != other.m_desc || m_desc->type->size != other.m_desc->type->size)
+        {
+            return false;
+        }
+
+        return std::memcmp(m_value.raw_data(), other.m_value.raw_data(), m_desc->type->size) == 0;
+    }
+
+    [[nodiscard]] auto operator!=(const Callable& other) const noexcept -> bool { return !(*this == other); }
+
+private:
+    friend struct detail::Access;
+
+    constexpr Callable(const detail::CallableDesc& desc, ObjectRef value) noexcept
+        : m_desc(&desc)
+        , m_value(value)
+    {
+    }
+
+    [[nodiscard]] auto box_impl(std::string_view operation, ObjectRef self, const Args& args) const -> Outcome<Object>
+    {
+        const Status checked = check_call(operation, self, args);
+        if (checked.is_err())
+        {
+            return checked.unwrap_err();
+        }
+
+        if (m_desc->invoke == nullptr)
+        {
+            return Error{ErrorKind::NotSupported,
+                         std::format("{}: the result of '{}' cannot be boxed (use invoke_ref())", operation,
+                                     m_desc->type->qualified_name)};
+        }
+
+        const detail::ArgumentPointers pointers(args);
+        void* const receiver = self.is_null() ? nullptr : const_cast<void*>(self.raw_data());
+        void* result = m_desc->invoke(m_value.raw_data(), receiver, pointers.data());
+        if (result == nullptr)
+        {
+            return Object{};
+        }
+
+        return Object::from_raw(result, m_desc->function_type->function_return->decayed);
+    }
+
+    [[nodiscard]] auto ref_impl(std::string_view operation, ObjectRef self, const Args& args) const -> Outcome<ObjectRef>
+    {
+        const Status checked = check_call(operation, self, args);
+        if (checked.is_err())
+        {
+            return checked.unwrap_err();
+        }
+
+        if (!returns_reference())
+        {
+            return Error{ErrorKind::NotSupported,
+                         std::format("{}: the callable does not return a reference; use invoke()",
+                                     context(operation))};
+        }
+
+        if (m_desc->invoke_ref == nullptr)
+        {
+            return Error{ErrorKind::NotSupported, std::format("{}: the callable cannot be invoked", context(operation))};
+        }
+
+        const detail::ArgumentPointers pointers(args);
+        void* const receiver = self.is_null() ? nullptr : const_cast<void*>(self.raw_data());
+        const void* address = m_desc->invoke_ref(m_value.raw_data(), receiver, pointers.data());
+        const detail::TypeDescriptor* referent = m_desc->function_type->function_return->referenced;
+
+        return ObjectRef(address, m_desc->function_type->function_return->decayed, referent->is_const_qualified,
+                         referent->is_volatile_qualified);
+    }
+
+    /// Argument count -> receiver -> left-to-right arguments (api_design §0.1).
+    [[nodiscard]] auto check_call(std::string_view operation, const ObjectRef& self, const Args& args) const -> Status
+    {
+        if (!m_desc->is_member_function_pointer && !self.is_null())
+        {
+            return Error{ErrorKind::NotSupported,
+                         std::format("{}: a free function pointer takes no receiver", context(operation))};
+        }
+
+        const std::size_t count = m_desc->function_type->function_parameter_count;
+        if (args.size() != count)
+        {
+            return Error{ErrorKind::InvalidArgument,
+                         std::format("{}: expected {} argument(s), got {}", context(operation), count, args.size())};
+        }
+
+        if (m_desc->is_member_function_pointer)
+        {
+            if (self.is_null())
+            {
+                return Error{ErrorKind::NullInstance,
+                             std::format("{}: the receiver is null", context(operation))};
+            }
+
+            if (self.descriptor() != m_desc->declaring_class->decayed)
+            {
+                return detail::receiver_mismatch(context(operation), m_desc->declaring_class, self);
+            }
+        }
+
+        for (std::size_t i = 0; i < count; ++i)
+        {
+            const Class* parameter = m_desc->function_type->function_parameters[i];
+            const detail::TypeDescriptor* decay = m_desc->function_type->function_parameter_decays[i];
+            if (!detail::accepts_argument(parameter, decay, args[i], true))
+            {
+                return detail::argument_mismatch(context(operation), i, parameter, decay, args[i], true);
+            }
+        }
+
+        return None{};
+    }
+
+    /// "Callable::invoke(void (*)(int))": the operation plus the pointer type.
+    [[nodiscard]] auto context(std::string_view operation) const -> std::string
+    {
+        return std::format("{}({})", operation, m_desc->type->qualified_name);
+    }
+
+    detail::CheckedDesc<detail::CallableDesc> m_desc;
+    ObjectRef                                 m_value;
 };
 
 inline auto ObjectRef::type() const -> const Class&
@@ -3605,6 +4262,648 @@ consteval auto annotation_value_is_readable(meta::info type) -> bool
     }
 
     return meta::is_class_type(type) || meta::is_union_type(type) ? false : true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 9: templates, function types, nested types, aggregate slots,
+// capabilities, and callable values (api_design §1–§5)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Whether a non-type template argument can be `extract`ed (same rules as an
+/// annotation value: pointers, members pointers and references cannot).
+consteval auto constant_value_is_readable(meta::info type) -> bool
+{
+    return annotation_value_is_readable(type);
+}
+
+/// A non-type template argument's value, held in static storage.
+template<meta::info A>
+struct TemplateArgumentValue
+{
+    using type = std::remove_const_t<typename[: meta::type_of(A) :]>;
+    static constexpr type value = meta::extract<type>(meta::constant_of(A));
+};
+
+template<meta::info A>
+consteval auto template_argument_value() -> const void*
+{
+    if constexpr (constant_value_is_readable(meta::type_of(A)))
+    {
+        return std::addressof(TemplateArgumentValue<A>::value);
+    }
+    else
+    {
+        return nullptr;
+    }
+}
+
+/**
+ * @brief Whether C is an instance of a class template
+ *
+ * cv-qualified and reference types are *not* specializations even though the
+ * compiler still reports their template arguments (S9 probe: `const
+ * std::vector<int>` has two), so that they read as "the plain type is a
+ * specialization" (api_design §1.2).
+ */
+consteval auto is_template_specialization_info(meta::info C) -> bool
+{
+    return meta::is_type(C) && meta::has_template_arguments(C) && !meta::is_const_type(C)
+        && !meta::is_volatile_type(C) && !meta::is_reference_type(C);
+}
+
+template<meta::info C>
+consteval auto template_argument_count() -> std::size_t
+{
+    if constexpr (is_template_specialization_info(C))
+    {
+        return meta::template_arguments_of(C).size();
+    }
+    else
+    {
+        return 0;
+    }
+}
+
+template<meta::info C, std::size_t I>
+consteval auto template_argument_info() -> meta::info
+{
+    return meta::template_arguments_of(C)[I];
+}
+
+/**
+ * @brief What one argument is
+ *
+ * Class-type non-type arguments are `is_object` rather than `is_value` on GCC
+ * 16.2 (S9 probe), so both count as Kind::Value. A parameter pack is flattened
+ * into independent arguments and never reaches Kind::Pack.
+ */
+template<meta::info A>
+consteval auto template_argument_kind() -> TemplateArgumentKind
+{
+    if constexpr (meta::is_type(A))
+    {
+        return TemplateArgumentKind::Type;
+    }
+    else if constexpr (meta::is_template(A))
+    {
+        return TemplateArgumentKind::Template;
+    }
+    else if constexpr (meta::is_value(A) || meta::is_object(A))
+    {
+        return TemplateArgumentKind::Value;
+    }
+    else
+    {
+        return TemplateArgumentKind::Pack;
+    }
+}
+
+/// The spelling of an entity: its identifier when it has one, else the compiler's
+/// display string (a template primary has no identifier usable as a type name).
+consteval auto entity_name(meta::info entity) -> std::string
+{
+    return std::string(meta::has_identifier(entity) ? meta::identifier_of(entity) : meta::display_string_of(entity));
+}
+
+/**
+ * @brief Qualified name of a template primary
+ *
+ * `display_string_of` on a class template is
+ * `template<class _Tp, class _Alloc> class std::vector`, which is not a name, so
+ * the qualified name is spliced from the identifier and the parent's display
+ * string (S8.1).
+ */
+consteval auto template_qualified_name(meta::info entity) -> std::string
+{
+    if (!meta::has_parent(entity))
+    {
+        return entity_name(entity);
+    }
+
+    const meta::info parent = meta::parent_of(entity);
+    if (meta::is_namespace(parent) && !meta::has_identifier(parent))
+    {
+        return entity_name(entity); // global namespace
+    }
+
+    std::string qualified(meta::display_string_of(parent));
+    qualified += "::";
+    qualified += entity_name(entity);
+    return qualified;
+}
+
+/**
+ * @brief Declaration-level descriptor of a template primary
+ *
+ * Keyed on the template *entity* (`meta::info`), because a primary template is
+ * not a type and therefore has no place in the type-keyed bundles. Exactly one
+ * instance per primary template, so `get_primary_template()` compares equal for
+ * every specialization of it.
+ */
+template<meta::info K>
+struct TemplateBundle
+{
+    TypeDescriptor desc;
+    Class          cls;
+};
+
+template<meta::info K>
+inline constexpr TemplateBundle<K> template_bundle = []() consteval -> TemplateBundle<K>
+{
+    TemplateBundle<K> bundle{};
+
+    TypeDescriptor desc{};
+    desc.name = std::define_static_string(meta::has_identifier(K) ? meta::identifier_of(K) : meta::display_string_of(K));
+    desc.qualified_name = std::define_static_string(template_qualified_name(K));
+    desc.normalized_name = std::define_static_string(normalize_type_name(template_qualified_name(K)));
+    desc.has_canonical_name = false; // never registered: it is not a type
+    desc.kind = TypeKind::Template;
+    desc.modifiers = Modifier::PUBLIC;
+    desc.self = std::addressof(template_bundle<K>.cls);
+    desc.decayed = std::addressof(template_bundle<K>.desc);
+
+    bundle.cls = Access::make<Class>(std::addressof(template_bundle<K>.desc));
+    bundle.desc = desc;
+    return bundle;
+}();
+
+// ── Function types (api_design §2.2) ──
+
+template<meta::info C>
+consteval auto function_parameter_count() -> std::size_t
+{
+    if constexpr (meta::is_function_type(C))
+    {
+        return meta::parameters_of(C).size();
+    }
+    else
+    {
+        return 0;
+    }
+}
+
+/// A parameter of a function *type* is a type reflection; a function *declaration*
+/// reports parameter entities instead, so both are handled (S8.4).
+template<meta::info C, std::size_t J>
+consteval auto function_parameter_type() -> meta::info
+{
+    constexpr meta::info P = meta::parameters_of(C)[J];
+    if constexpr (meta::is_type(P))
+    {
+        return P;
+    }
+    else
+    {
+        return meta::type_of(P);
+    }
+}
+
+// ── Nested types (api_design §4) ──
+
+/**
+ * @brief Whether one member is a nested type to report
+ *
+ * The alias test must come first: `is_class_type` penetrates an alias, so
+ * `using Alias = Inner;` would otherwise be listed as a class of its own (S8.5).
+ * Incomplete nested types and uninstantiated member templates are skipped,
+ * because neither can be materialized.
+ */
+consteval auto is_nested_type_member(meta::info member) -> bool
+{
+    if (!meta::is_type(member) || meta::is_type_alias(member) || meta::is_template(member))
+    {
+        return false;
+    }
+
+    const meta::info target = meta::dealias(member);
+    if (!meta::is_complete_type(target))
+    {
+        return false;
+    }
+
+    return meta::is_class_type(target) || meta::is_union_type(target) || meta::is_enum_type(target);
+}
+
+template<meta::info C>
+consteval auto nested_type_count() -> std::size_t
+{
+    if constexpr (is_unqualified_class(C) && !is_std_type(C))
+    {
+        std::size_t count = 0;
+        for (meta::info member : meta::members_of(C, unchecked_context()))
+        {
+            if (is_nested_type_member(member))
+            {
+                ++count;
+            }
+        }
+        return count;
+    }
+    else
+    {
+        return 0;
+    }
+}
+
+template<meta::info C, std::size_t I>
+consteval auto nested_type_member() -> meta::info
+{
+    std::size_t index = 0;
+    for (meta::info member : meta::members_of(C, unchecked_context()))
+    {
+        if (is_nested_type_member(member))
+        {
+            if (index == I)
+            {
+                return member;
+            }
+            ++index;
+        }
+    }
+    return meta::info{};
+}
+
+/// The class a type is declared in (None at namespace scope / for non-nested types).
+template<meta::info C>
+consteval auto enclosing_class_info() -> meta::info
+{
+    if constexpr (meta::has_parent(C) && meta::is_type(meta::parent_of(C))
+                  && (meta::is_class_type(meta::parent_of(C)) || meta::is_union_type(meta::parent_of(C))))
+    {
+        return meta::parent_of(C);
+    }
+    else
+    {
+        return meta::info{};
+    }
+}
+
+// ── Capability bits (api_design §5.2) ──
+
+template<meta::info C>
+consteval auto capabilities_of() -> std::uint32_t
+{
+    std::uint32_t bits = 0;
+    if constexpr ((meta::is_class_type(C) || meta::is_union_type(C)) && meta::is_complete_type(C))
+    {
+        if (meta::is_trivially_copyable_type(C))             { bits |= static_cast<std::uint32_t>(Capability::TriviallyCopyable); }
+        if (meta::is_trivially_default_constructible_type(C)) { bits |= static_cast<std::uint32_t>(Capability::TriviallyDefaultConstructible); }
+        if (meta::is_trivially_destructible_type(C))         { bits |= static_cast<std::uint32_t>(Capability::TriviallyDestructible); }
+        if (meta::has_virtual_destructor(C))                 { bits |= static_cast<std::uint32_t>(Capability::VirtualDestructor); }
+        if (meta::is_standard_layout_type(C))                { bits |= static_cast<std::uint32_t>(Capability::StandardLayout); }
+        if (meta::has_unique_object_representations(C))      { bits |= static_cast<std::uint32_t>(Capability::UniqueObjectRepresentations); }
+    }
+    return bits;
+}
+
+// ── Aggregate initialization slots (api_design §3.2) ──
+
+/**
+ * @brief The initializer list of an aggregate: public bases, then data members
+ *
+ * A base slot holds the *base class itself* (aggregate initialization
+ * copy-initializes the base subobject), not the base's members (S8.6).
+ */
+consteval auto aggregate_slot_types(meta::info C) -> std::vector<meta::info>
+{
+    std::vector<meta::info> slots;
+    for (meta::info base : meta::bases_of(C, unchecked_context()))
+    {
+        if (meta::is_public(base) && !meta::is_virtual(base))
+        {
+            slots.push_back(meta::type_of(base));
+        }
+    }
+
+    for (meta::info member : meta::nonstatic_data_members_of(C, unchecked_context()))
+    {
+        slots.push_back(meta::type_of(member));
+    }
+
+    return slots;
+}
+
+/// Whether one slot can be filled from a *value*: an lvalue of the slot type is
+/// passed to the aggregate initializer, so a copy is needed (except for lvalue
+/// references), and neither an array nor an rvalue-reference member can bind to
+/// it (api_design §3.2).
+consteval auto aggregate_slot_is_usable(meta::info type) -> bool
+{
+    if (meta::is_rvalue_reference_type(type) || meta::is_array_type(type))
+    {
+        return false;
+    }
+
+    if (meta::is_reference_type(type))
+    {
+        return true;
+    }
+
+    return meta::is_copy_constructible_type(type);
+}
+
+/**
+ * @brief Whether C can be built through new_aggregate()
+ *
+ * Only an unqualified class type qualifies: a cv-qualified copy cannot be built,
+ * and a union aggregate initializes a single member (there is no positional list
+ * to fill). Beyond "is an aggregate" (which already excludes private data members
+ * since C++20) the bases must all be public, and every slot must be fillable.
+ */
+consteval auto is_aggregate_initializable(meta::info C) -> bool
+{
+    if (!is_unqualified_class(C) || meta::is_union_type(C) || !meta::is_complete_type(C)
+        || !meta::is_aggregate_type(C))
+    {
+        return false;
+    }
+
+    for (meta::info base : meta::bases_of(C, unchecked_context()))
+    {
+        if (!meta::is_public(base) || meta::is_virtual(base))
+        {
+            return false;
+        }
+    }
+
+    for (meta::info slot : aggregate_slot_types(C))
+    {
+        if (!aggregate_slot_is_usable(slot))
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+template<meta::info C>
+consteval auto aggregate_slot_count() -> std::size_t
+{
+    if constexpr (is_aggregate_initializable(C))
+    {
+        return aggregate_slot_types(C).size();
+    }
+    else
+    {
+        return 0;
+    }
+}
+
+template<meta::info C>
+consteval auto aggregate_slot_tuple() -> meta::info
+{
+    return meta::substitute(^^std::tuple, aggregate_slot_types(C));
+}
+
+template<meta::info C, std::size_t J>
+consteval auto aggregate_slot_type() -> meta::info
+{
+    return aggregate_slot_types(C)[J];
+}
+
+/// `Ty(int, double)`: the pseudo constructor's signature (the slot types).
+template<meta::info C>
+consteval auto aggregate_signature() -> std::string
+{
+    std::string signature(meta::display_string_of(C));
+    signature += "(";
+    const std::vector<meta::info> slots = aggregate_slot_types(C);
+    for (std::size_t i = 0; i < slots.size(); ++i)
+    {
+        signature += i == 0 ? "" : ", ";
+        signature += meta::display_string_of(slots[i]);
+    }
+    signature += ")";
+    return signature;
+}
+
+/// Reads slot I of a call's arguments as an lvalue of the slot type.
+template<std::size_t I, typename Slots>
+auto aggregate_slot_ref(const void* const* args) -> std::remove_reference_t<std::tuple_element_t<I, Slots>>&
+{
+    using Slot = std::tuple_element_t<I, Slots>;
+    using Value = std::remove_reference_t<Slot>;
+    return *static_cast<Value*>(const_cast<void*>(args[I]));
+}
+
+template<meta::info C, std::size_t... I>
+consteval auto make_aggregate_new_instance(std::index_sequence<I...>) -> CtorFn
+{
+    using Self = typename[: C :];
+    using Slots = typename[: aggregate_slot_tuple<C>() :];
+
+    return +[](const void* const* args) -> void*
+    {
+        return new Self(aggregate_slot_ref<I, Slots>(args)...);
+    };
+}
+
+template<meta::info C, std::size_t... I>
+consteval auto make_aggregate_construct_at(std::index_sequence<I...>) -> PlacementCtorFn
+{
+    using Self = typename[: C :];
+    using Slots = typename[: aggregate_slot_tuple<C>() :];
+
+    return +[](void* storage, const void* const* args) -> void
+    {
+        ::new (storage) Self(aggregate_slot_ref<I, Slots>(args)...);
+    };
+}
+
+// ── Callable values (api_design §2.3) ──
+
+/// One argument of a call, as the parameter category expects it.
+template<typename P, std::size_t I>
+decltype(auto) parameter_argument(const void* const* args)
+{
+    using Value = std::remove_reference_t<P>;
+    Value& ref = *static_cast<Value*>(const_cast<void*>(args[I]));
+
+    if constexpr (std::is_rvalue_reference_v<P>)
+    {
+        return static_cast<Value&&>(ref);
+    }
+    else
+    {
+        return static_cast<Value&>(ref);
+    }
+}
+
+/// A by-value parameter needs a copy the argument type may not have.
+template<typename P>
+inline constexpr bool callable_parameter_loadable = std::is_reference_v<P> || std::is_constructible_v<P, P&>;
+
+template<typename... P>
+inline constexpr bool callable_parameters_loadable = (callable_parameter_loadable<P> && ...);
+
+/**
+ * @brief Calling a free function pointer of one exact type
+ *
+ * `R (*)(P...)` is the only pair of specializations needed (the `noexcept`
+ * variant is separate because it is a distinct type).
+ */
+template<typename Pointer>
+struct function_pointer_call;
+
+#define SPECULO_FUNCTION_POINTER_CALL(Qual)                                                          \
+    template<typename R, typename... P>                                                              \
+    struct function_pointer_call<R (*)(P...) Qual>                                                   \
+    {                                                                                                \
+        using return_type = R;                                                                       \
+        using function_type = R(P...) Qual;                                                          \
+        using pointer_type = R (*)(P...) Qual;                                                       \
+                                                                                                     \
+        static constexpr bool can_box = !std::is_reference_v<R>                                      \
+            ? callable_parameters_loadable<P...>                                                     \
+            : (callable_parameters_loadable<P...> && std::is_constructible_v<std::remove_cvref_t<R>, R>); \
+                                                                                                     \
+        static auto box(const void* callable, void*, const void* const* args) -> void*               \
+        {                                                                                            \
+            const pointer_type function = *static_cast<const pointer_type*>(callable);                \
+            return box_with(function, args, std::index_sequence_for<P...>{});                        \
+        }                                                                                            \
+                                                                                                     \
+        static auto ref(const void* callable, void*, const void* const* args) -> const void*         \
+        {                                                                                            \
+            const pointer_type function = *static_cast<const pointer_type*>(callable);                \
+            return ref_with(function, args, std::index_sequence_for<P...>{});                        \
+        }                                                                                            \
+                                                                                                     \
+    private:                                                                                         \
+        template<std::size_t... I>                                                                   \
+        static auto box_with(pointer_type function, const void* const* args,                          \
+                             std::index_sequence<I...>) -> void*                                     \
+        {                                                                                            \
+            if constexpr (std::is_void_v<R>)                                                         \
+            {                                                                                        \
+                function(parameter_argument<P, I>(args)...);                                         \
+                return nullptr;                                                                      \
+            }                                                                                        \
+            else                                                                                     \
+            {                                                                                        \
+                return new std::remove_cvref_t<R>(function(parameter_argument<P, I>(args)...));      \
+            }                                                                                        \
+        }                                                                                            \
+                                                                                                     \
+        template<std::size_t... I>                                                                   \
+        static auto ref_with(pointer_type function, const void* const* args,                         \
+                             std::index_sequence<I...>) -> const void*                               \
+        {                                                                                            \
+            R result = function(parameter_argument<P, I>(args)...);                                  \
+            return const_cast<const void*>(static_cast<const volatile void*>(std::addressof(result))); \
+        }                                                                                            \
+    };
+
+SPECULO_FUNCTION_POINTER_CALL()
+SPECULO_FUNCTION_POINTER_CALL(noexcept)
+
+#undef SPECULO_FUNCTION_POINTER_CALL
+
+/// A C-variadic function pointer is reflected (its fixed parameters are listed)
+/// but cannot be called from a fixed argument array -- same rule as Method.
+template<typename R, typename... P>
+struct function_pointer_call<R (*)(P..., ...)>
+{
+    using return_type = R;
+    using function_type = R(P..., ...);
+
+    static constexpr bool can_box = false;
+};
+
+/**
+ * @brief Calling a member function pointer of one exact qualification
+ *
+ * A member-function-pointer *type* cannot be decomposed with `std::meta` (S8.4:
+ * `return_type_of` / `parameters_of` / `parent_of` all throw), so the parameter
+ * list can only be recovered by deduction -- hence one specialization per
+ * cv / ref / noexcept combination, like `member_function_pointer` above.
+ */
+template<typename Pointer>
+struct member_pointer_call;
+
+#define SPECULO_MEMBER_POINTER_CALL(Qual)                                                            \
+    template<typename R, typename C, typename... P>                                                  \
+    struct member_pointer_call<R (C::*)(P...) Qual>                                                  \
+    {                                                                                                \
+        using return_type = R;                                                                       \
+        using caller_type = C;                                                                       \
+        using function_type = R(P...) Qual;                                                          \
+        using pointer_type = R (C::*)(P...) Qual;                                                    \
+                                                                                                     \
+        static constexpr bool can_box = !std::is_reference_v<R>                                      \
+            ? callable_parameters_loadable<P...>                                                     \
+            : (callable_parameters_loadable<P...> && std::is_constructible_v<std::remove_cvref_t<R>, R>); \
+                                                                                                     \
+        static auto box(const void* callable, void* self, const void* const* args) -> void*          \
+        {                                                                                            \
+            const pointer_type function = *static_cast<const pointer_type*>(callable);                \
+            return box_with(function, static_cast<C*>(self), args, std::index_sequence_for<P...>{});  \
+        }                                                                                            \
+                                                                                                     \
+        static auto ref(const void* callable, void* self, const void* const* args) -> const void*     \
+        {                                                                                            \
+            const pointer_type function = *static_cast<const pointer_type*>(callable);                \
+            return ref_with(function, static_cast<C*>(self), args, std::index_sequence_for<P...>{});  \
+        }                                                                                            \
+                                                                                                     \
+    private:                                                                                         \
+        template<std::size_t... I>                                                                   \
+        static auto box_with(pointer_type function, C* object, const void* const* args,              \
+                             std::index_sequence<I...>) -> void*                                     \
+        {                                                                                            \
+            if constexpr (std::is_void_v<R>)                                                         \
+            {                                                                                        \
+                (object->*function)(parameter_argument<P, I>(args)...);                               \
+                return nullptr;                                                                      \
+            }                                                                                        \
+            else                                                                                     \
+            {                                                                                        \
+                return new std::remove_cvref_t<R>((object->*function)(parameter_argument<P, I>(args)...)); \
+            }                                                                                        \
+        }                                                                                            \
+                                                                                                     \
+        template<std::size_t... I>                                                                   \
+        static auto ref_with(pointer_type function, C* object, const void* const* args,              \
+                             std::index_sequence<I...>) -> const void*                               \
+        {                                                                                            \
+            R result = (object->*function)(parameter_argument<P, I>(args)...);                        \
+            return const_cast<const void*>(static_cast<const volatile void*>(std::addressof(result))); \
+        }                                                                                            \
+    };
+
+SPECULO_MEMBER_POINTER_CALL()
+SPECULO_MEMBER_POINTER_CALL(const)
+SPECULO_MEMBER_POINTER_CALL(volatile)
+SPECULO_MEMBER_POINTER_CALL(const volatile)
+SPECULO_MEMBER_POINTER_CALL(&)
+SPECULO_MEMBER_POINTER_CALL(const &)
+SPECULO_MEMBER_POINTER_CALL(volatile &)
+SPECULO_MEMBER_POINTER_CALL(const volatile &)
+SPECULO_MEMBER_POINTER_CALL(&&)
+SPECULO_MEMBER_POINTER_CALL(const &&)
+SPECULO_MEMBER_POINTER_CALL(volatile &&)
+SPECULO_MEMBER_POINTER_CALL(const volatile &&)
+SPECULO_MEMBER_POINTER_CALL(noexcept)
+SPECULO_MEMBER_POINTER_CALL(const noexcept)
+SPECULO_MEMBER_POINTER_CALL(volatile noexcept)
+SPECULO_MEMBER_POINTER_CALL(const volatile noexcept)
+SPECULO_MEMBER_POINTER_CALL(& noexcept)
+SPECULO_MEMBER_POINTER_CALL(const & noexcept)
+SPECULO_MEMBER_POINTER_CALL(volatile & noexcept)
+SPECULO_MEMBER_POINTER_CALL(const volatile & noexcept)
+SPECULO_MEMBER_POINTER_CALL(&& noexcept)
+SPECULO_MEMBER_POINTER_CALL(const && noexcept)
+SPECULO_MEMBER_POINTER_CALL(volatile && noexcept)
+SPECULO_MEMBER_POINTER_CALL(const volatile && noexcept)
+
+#undef SPECULO_MEMBER_POINTER_CALL
+
+/// A base offset that folds to a constant (api_design §6: no run-time work).
+template<std::size_t Offset>
+auto constant_offset() -> std::size_t
+{
+    return Offset;
 }
 
 /// Annotations of one reflected entity (`annotations_of(Entity)`).
@@ -4520,6 +5819,7 @@ consteval auto make_descriptor(const Class* self, const void* fields, std::size_
         desc.is_final = meta::is_final_type(C);
         desc.is_aggregate = meta::is_aggregate_type(C);
         desc.is_empty = meta::is_empty_type(C);
+        desc.capabilities = capabilities_of<C>();
 
         // A nested class carries its declared access; a namespace-scope class
         // (for which none of the three predicates holds) is public.
@@ -4627,6 +5927,22 @@ struct TypeBundle
 
     std::array<EnumDesc, enumerator_count<info_of<T>()>()> enum_descs{};
     std::array<Enumerator, enumerator_count<info_of<T>()>()> enum_handles{};
+
+    // ── Phase 9: structure ──
+    std::array<TemplateArgDesc, template_argument_count<info_of<T>()>()> template_arg_descs{};
+    std::array<TemplateArgument, template_argument_count<info_of<T>()>()> template_arg_handles{};
+
+    std::array<const Class*, function_parameter_count<info_of<T>()>()> function_parameter_classes{};
+    std::array<const TypeDescriptor*, function_parameter_count<info_of<T>()>()> function_parameter_decays{};
+
+    std::array<const Class*, nested_type_count<info_of<T>()>()> nested_classes{};
+
+    std::array<const Class*, aggregate_slot_count<info_of<T>()>()> aggregate_parameter_classes{};
+    std::array<const TypeDescriptor*, aggregate_slot_count<info_of<T>()>()> aggregate_parameter_decays{};
+    CtorDesc    aggregate_ctor_desc;
+    Constructor aggregate_ctor_handle;
+
+    CallableDesc callable_desc;
 
     TypeDescriptor dynamic_array_desc;  ///< the E[] view for dynamic arrays of T
     Class          dynamic_array_cls;
@@ -4813,6 +6129,13 @@ inline constexpr TypeBundle<T> bundle = []() consteval -> TypeBundle<T>
             }
             b.bases[I].annotations = own_annotations<B>().handles.data();
             b.bases[I].annotation_count = own_annotations<B>().count;
+            // Static offset of the base subobject. A virtual base has no constant
+            // offset (it changes with the complete object), and an inaccessible
+            // base cannot be reached at namespace scope, so both keep a null thunk.
+            if constexpr (meta::is_public(B) && !meta::is_virtual(B))
+            {
+                b.bases[I].offset = &constant_offset<static_cast<std::size_t>(meta::offset_of(B).bytes)>;
+            }
         }()), ...);
     }(std::make_index_sequence<base_count<C>()>{});
 
@@ -4843,6 +6166,164 @@ inline constexpr TypeBundle<T> bundle = []() consteval -> TypeBundle<T>
         // is not required).
         b.desc.annotations = own_annotations<meta::remove_cv(C)>().handles.data();
         b.desc.annotation_count = own_annotations<meta::remove_cv(C)>().count;
+    }
+
+    // ── Phase 9: template arguments (api_design §1) ──
+    [&b]<std::size_t... I>(std::index_sequence<I...>)
+    {
+        (([&b]()
+        {
+            constexpr meta::info A = template_argument_info<C, I>();
+            constexpr TemplateArgumentKind kind = template_argument_kind<A>();
+
+            TemplateArgDesc desc{};
+            desc.kind = kind;
+            desc.spelling = std::define_static_string(meta::display_string_of(A));
+            if constexpr (kind == TemplateArgumentKind::Type)
+            {
+                desc.type = std::addressof(bundle<typename[: A :]>.desc);
+            }
+            else if constexpr (kind == TemplateArgumentKind::Template)
+            {
+                desc.primary_template = std::addressof(template_bundle<A>.desc);
+            }
+            else if constexpr (kind == TemplateArgumentKind::Value)
+            {
+                using ValueType = std::remove_cv_t<typename[: meta::type_of(A) :]>;
+                desc.type = std::addressof(bundle<ValueType>.desc);
+                desc.value = template_argument_value<A>();
+            }
+
+            b.template_arg_descs[I] = desc;
+            b.template_arg_handles[I] = Access::make<TemplateArgument>(std::addressof(bundle<T>.template_arg_descs[I]));
+        }()), ...);
+    }(std::make_index_sequence<template_argument_count<C>()>{});
+
+    if constexpr (is_template_specialization_info(C))
+    {
+        b.desc.primary_template = std::addressof(template_bundle<meta::template_of(C)>.desc);
+        b.desc.template_arguments = bundle<T>.template_arg_handles.data();
+        b.desc.template_argument_count = template_argument_count<C>();
+    }
+
+    // ── Phase 9: function type decomposition (api_design §2.2) ──
+    [&b]<std::size_t... K>(std::index_sequence<K...>)
+    {
+        std::array<const Class*, sizeof...(K)> classes{
+            std::addressof(bundle<typename[: function_parameter_type<C, K>() :]>.cls)...
+        };
+        std::array<const TypeDescriptor*, sizeof...(K)> decays{
+            std::addressof(bundle<std::remove_cvref_t<typename[: function_parameter_type<C, K>() :]>>.desc)...
+        };
+        for (std::size_t k = 0; k < classes.size(); ++k)
+        {
+            b.function_parameter_classes[k] = classes[k];
+            b.function_parameter_decays[k] = decays[k];
+        }
+    }(std::make_index_sequence<function_parameter_count<C>()>{});
+
+    if constexpr (meta::is_function_type(C))
+    {
+        using FunctionReturn = typename[: meta::return_type_of(C) :];
+        b.desc.function_return = std::addressof(bundle<FunctionReturn>.desc);
+        b.desc.function_parameters = bundle<T>.function_parameter_classes.data();
+        b.desc.function_parameter_decays = bundle<T>.function_parameter_decays.data();
+        b.desc.function_parameter_count = function_parameter_count<C>();
+        b.desc.function_is_variadic = meta::is_vararg_function(C);
+        b.desc.function_is_noexcept = meta::is_noexcept(C);
+    }
+
+    // ── Phase 9: nested types (api_design §4) ──
+    [&b]<std::size_t... K>(std::index_sequence<K...>)
+    {
+        ((b.nested_classes[K] = std::addressof(bundle<typename[: nested_type_member<C, K>() :]>.cls)), ...);
+    }(std::make_index_sequence<nested_type_count<C>()>{});
+
+    b.desc.nested_types = bundle<T>.nested_classes.data();
+    b.desc.nested_type_count = nested_type_count<C>();
+
+    if constexpr (meta::has_parent(C))
+    {
+        constexpr meta::info Parent = meta::parent_of(C);
+        // A namespace parent is not a type (`is_type` guards is_class_type, which
+        // throws for non-types).
+        if constexpr (meta::is_type(Parent) && (meta::is_class_type(Parent) || meta::is_union_type(Parent)))
+        {
+            b.desc.enclosing_class = std::addressof(bundle<typename[: Parent :]>.desc);
+        }
+    }
+
+    // ── Phase 9: aggregate initializer (api_design §3) ──
+    if constexpr (is_aggregate_initializable(C))
+    {
+        [&b]<std::size_t... K>(std::index_sequence<K...>)
+        {
+            std::array<const Class*, sizeof...(K)> classes{
+                std::addressof(bundle<typename[: aggregate_slot_type<C, K>() :]>.cls)...
+            };
+            std::array<const TypeDescriptor*, sizeof...(K)> decays{
+                std::addressof(bundle<std::remove_cvref_t<typename[: aggregate_slot_type<C, K>() :]>>.desc)...
+            };
+            for (std::size_t k = 0; k < classes.size(); ++k)
+            {
+                b.aggregate_parameter_classes[k] = classes[k];
+                b.aggregate_parameter_decays[k] = decays[k];
+            }
+        }(std::make_index_sequence<aggregate_slot_count<C>()>{});
+
+        CtorDesc aggregate_desc{};
+        aggregate_desc.signature = std::define_static_string(aggregate_signature<C>());
+        aggregate_desc.declaring_class = std::addressof(bundle<T>.desc);
+        aggregate_desc.parameter_types = bundle<T>.aggregate_parameter_classes.data();
+        aggregate_desc.parameter_decays = bundle<T>.aggregate_parameter_decays.data();
+        aggregate_desc.parameter_count = aggregate_slot_count<C>();
+        aggregate_desc.modifiers = Modifier::PUBLIC;
+        aggregate_desc.new_instance = make_aggregate_new_instance<C>(std::make_index_sequence<aggregate_slot_count<C>()>{});
+        aggregate_desc.construct_at = make_aggregate_construct_at<C>(std::make_index_sequence<aggregate_slot_count<C>()>{});
+        if constexpr (meta::is_destructible_type(C))
+        {
+            aggregate_desc.destroy_at = &canonical_destroy<T>;
+        }
+
+        b.aggregate_ctor_desc = aggregate_desc;
+        b.aggregate_ctor_handle = Access::make<Constructor>(std::addressof(bundle<T>.aggregate_ctor_desc));
+        b.desc.aggregate_initializer = std::addressof(bundle<T>.aggregate_ctor_handle);
+    }
+
+    // ── Phase 9: callable values (api_design §2.3) ──
+    if constexpr (std::is_pointer_v<T> && std::is_function_v<std::remove_pointer_t<T>>)
+    {
+        using Call = function_pointer_call<T>;
+        b.callable_desc.type = std::addressof(bundle<T>.desc);
+        b.callable_desc.function_type = std::addressof(bundle<typename Call::function_type>.desc);
+        if constexpr (Call::can_box)
+        {
+            b.callable_desc.invoke = &Call::box;
+        }
+        if constexpr (std::is_reference_v<typename Call::return_type>)
+        {
+            b.callable_desc.returns_reference = true;
+            b.callable_desc.invoke_ref = &Call::ref;
+        }
+        b.desc.callable = std::addressof(bundle<T>.callable_desc);
+    }
+    else if constexpr (std::is_member_function_pointer_v<T>)
+    {
+        using Call = member_pointer_call<T>;
+        b.callable_desc.type = std::addressof(bundle<T>.desc);
+        b.callable_desc.function_type = std::addressof(bundle<typename Call::function_type>.desc);
+        b.callable_desc.declaring_class = std::addressof(bundle<typename Call::caller_type>.desc);
+        b.callable_desc.is_member_function_pointer = true;
+        if constexpr (Call::can_box)
+        {
+            b.callable_desc.invoke = &Call::box;
+        }
+        if constexpr (std::is_reference_v<typename Call::return_type>)
+        {
+            b.callable_desc.returns_reference = true;
+            b.callable_desc.invoke_ref = &Call::ref;
+        }
+        b.desc.callable = std::addressof(bundle<T>.callable_desc);
     }
 
     // ── Decomposition / qualification: cross-bundle references (dependent

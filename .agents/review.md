@@ -587,3 +587,71 @@ method.invoke(obj, {std::string("x")});   // 不能编译
 验收口径达成：S8.1–S8.10 每项有结论，`spikes/s8_*.cpp` 全部可独立编译运行，
 ⚠️ / ❌ 项（S8.3、S8.4）的偏差已写回 `api_design.md` §2.2 / §5.2 / §5.3。
 
+## 9. Phase 9：类型系统建模（2026-10-30 完成）
+
+环境同上（MSYS2 ucrt64 GCC 16.2.0，`-std=c++26 -freflection -fno-rtti -fno-exceptions`）。
+落地内容：`TypeKind::Template`、`TemplateArgument`（四种 kind）、`Class` / `Function` 的模板
+查询、函数类型分解、`Callable`、聚合构造、嵌套类型、布局/能力谓词、`BaseClass::get_offset`。
+`ctest` 5/5、`xmake test` 5/5，268 个用例全绿（新增 46 个）。
+
+### 9.1 动手前补做的探针（`spikes/s9_*.cpp`）
+
+S8 没有覆盖「这些能力能不能被**物化**进运行期描述表」，Phase 9 开工前补了 3 个探针：
+
+| 文件 | 覆盖 | 结论 |
+|---|---|---|
+| `s9_1_probe.cpp` | 以 `meta::info` 为键的变量模板（主模板的声明级描述）、NTTP 装箱、函数模板特化、`offset_of(基类)` | 全部可用；跨特化共享同一实例；`offset_of` 接受基类反射 |
+| `s9_2_probe.cpp` | 类类型 NTTP 的反射种类、虚基 `offset_of`、cv 特化的模板实参、聚合 splat（含运行期调用）、嵌套类型分类 | 类类型 NTTP 是 `is_object`；`offset_of` 对虚基也给数（但我们仍返回 `None`）；聚合 thunk 运行期可用 |
+| `s9_3_cycle.cpp` | 两个 bundle 互相取地址（父的嵌套表 ↔ 子的 `enclosing`）是否触发「使用未初始化变量」 | 取地址不读值，循环安全；实测两边地址都正确 |
+
+新增的编译器事实（都已回写 `api_design.md`）：
+
+1. **`is_class_type` / `is_union_type` 对非类型反射抛 `std::meta::exception`**，不是返回
+   false。取 `parent_of(C)` 之后必须先 `is_type(parent)` 再判类别（`s9_3` 第一次就踩到）。
+2. **`offset_of` 接受基类反射**，虚基也给一个数（该数只对当前完整对象成立，所以仍返回
+   `None`）。`BaseClass::get_offset` 因此不需要假指针，也不需要 `void*` 形参。
+3. **类类型 NTTP 是 `is_object`，不是 `is_value`**（`is_type`/`is_template` 都为假），
+   但 `constant_of` + `extract` 正常。`Kind::Value` 的判据是 `is_value || is_object`。
+4. **cv 限定的特化仍有模板实参**（`const std::vector<int>` 报 2 个），`is_template_specialization`
+   因此要显式排除 cv / 引用，与 §1.2 的约定一致。
+5. `template_arguments_of` 的返回值是堆上的 `std::vector`，**不能存进 `constexpr` 变量**
+   （「refers to a result of operator new」）；只能按索引在 `consteval` 函数里逐项取。
+6. 聚合初始化**不能**从数组左值拷贝（`S{arr}` 对 `int a[2]` 成员非法），数组成员只能
+   braced-init —— 所以数组成员按设计返回 `NotSupported`。
+7. `meta::info` 键的变量模板可以自引用（`desc.self = &template_bundle<K>.cls`），
+   与类型键的 `TypeBundle` 同一套路。
+
+### 9.2 实现偏差（已回写 `api_design.md`）
+
+| 项 | 原设计 | 实际 | 原因 |
+|---|---|---|---|
+| 4 个双类型谓词 | `Class` 成员，收 `const Class&` | **自由函数模板**（`is_convertible_to<From,To>()` 等） | 编译器 trait 要求两侧都是编译期类型；运行期 `const Class&` 无法还原成模板实参（无 RTTI），物化期也无法枚举类型对。成员模板同样不行（`this` 不带类型） |
+| `Function::get_primary_template` | 与 `Class` 同一组三个查询 | 只给 `is_template_specialization` / `get_template_arguments` / `get_template_argument_type` | 未实例化的函数模板没有形参类型，物化不出 `FunctionDesc` |
+| `BaseClass::offset_fn` | `void*` → `size_t` 的 thunk（cast 减指针差） | 无参 `size_t()` thunk，值来自 `offset_of(基)` | 探针证明偏移在物化期就是常量，不需要对象 |
+| 聚合槽位 | 「数组 / 引用 / const 成员不可初始化」 | const 与 `T&` 可初始化；数组与 `T&&` 不可；**联合体整体不支持** | 语言规则：聚合初始化能拷贝初始化 const 成员、能绑定左值引用；不能从数组左值拷贝；联合体只填一个成员，没有位置清单 |
+| `Callable::invoke(ObjectRef self, Args)` | 文档未给默认实参 | 两个重载都**不**给 `Args` 默认值 | 否则 `invoke(ref)` 会在「一个实参」与「零实参 + 接收者」之间静默选错 |
+| C 可变参数函数指针 | 未提 | 可描述但 `is_invokable() == false` | 与 `Method` 的既有规则一致（固定实参数组驱动不了 `...`） |
+
+`Callable::operator==` 由「存储地址」改为「指针类型 + 指针值字节比较」，这样两块不同
+存储里的同一个函数相等（测试 `CallableTest.IdentityIsTheTypeAndTheValue`）。
+
+**成员函数指针的调用 thunk 走的是「模板推导」而不是 `<meta>`**：S8.4 已证明 MFP 类型
+不能分解，所以 `detail::member_pointer_call<R (C::*)(P...) cv-ref-noexcept>` 有 24 个
+特化（每个只声明 `return_type` / `caller_type` / `function_type`），`Callable::get_function_type()`
+因此也能给出 `R(P...) const` 这样的函数类型，并复用 `bundle<F>` 的函数类型分解。
+
+### 9.3 测试
+
+新增文件与覆盖（`tests/README.md` 已同步）：
+
+| 文件 | 用例数 | 覆盖 |
+|---|---|---|
+| `template_test.cpp` | 12 | 类型/NTTP/模板模板/包展平、主模板共享与命名、cv 特化、函数模板、空句柄 `EXPECT_DEATH` |
+| `callable_test.cpp` | 11 | 函数指针 / 成员指针、虚派发、引用返回视图、可变参数、错误优先级矩阵（4 × 3）、恒等 |
+| `aggregate_test.cpp` | 7 | 伪构造函数描述、基类+成员填充、`construct_at`/`destroy_at`、`Object::make_aggregate`、const/引用槽位、5 类不支持形状、错误顺序 |
+| `nested_type_test.cpp` | 4 | 声明序、别名/模板/不完整/继承的排除、访问级别、类模板实例内的嵌套、`enclosing` |
+| `layout_traits_test.cpp` | 6 | 6 个单类型谓词 × 10 类类型与 `<type_traits>` 交叉验证、非类类型返回 false、联合体、`is_bit_castable_to`、4 个双类型谓词与 trait 交叉验证（含操作数顺序） |
+| `base_offset_test.cpp` | 7 | 多基偏移、EBO、与 `cast_to` 的两路一致性、虚基/私有基 `None`、含 vptr 的基、无基类 |
+
+`Clang`/MSVC 未验证（本库只面向 GCC 16+）。双构建系统（CMake + xmake）均全绿。
+

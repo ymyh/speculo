@@ -20,6 +20,7 @@ comment above the loop, and every cell of the product is asserted:
 | `ArrayOperationMatrix` | `array_test.cpp` | object form × operation (5 × 4 + the `Option` column) |
 | `CastMatrix` | `inheritance_test.cpp` | target base × receiver constness (5 × 2) |
 | `EnumConversionMatrix` | `enumerator_test.cpp` | enum × conversion (4 × 6) |
+| `CallableInvokeMatrix` | `callable_test.cpp` | receiver form × argument form (4 × 3, error precedence) |
 | `IntBindingMatrix`, `NumericExactMatchMatrix`, `PointerBindingMatrix`, `BoxBindingMatrix`, `OptionStateMatrix`, `ResultStateMatrix` | `function_test.cpp` | free-function arguments / return kinds |
 
 The precedence tables (`MethodInvokeMatrix`, `FieldSetMatrix`, `ClassMethodLookupMatrix`)
@@ -50,6 +51,12 @@ from per-row data, so their tables are written literally next to the loop.
 | `std_library_test.cpp` | Reflecting standard-library types and anonymous unions |
 | `annotation_test.cpp` | C++26 annotations (`[[= expr]]`) on classes, fields, methods |
 | `function_test.cpp` | Free functions: lookup, overloads, invocation, registry |
+| `template_test.cpp` | `TemplateArgument`, `Class` / `Function` template queries, primary templates |
+| `callable_test.cpp` | `Callable::of`, `invoke` / `invoke_ref` on function and member pointers |
+| `aggregate_test.cpp` | `Class::new_aggregate`, `get_aggregate_initializer`, `Object::make_aggregate` |
+| `nested_type_test.cpp` | `Class::get_declared_classes`, `get_enclosing_class` |
+| `layout_traits_test.cpp` | Layout / capability predicates, cross-checked against `<type_traits>` |
+| `base_offset_test.cpp` | `BaseClass::get_offset`, cross-checked against `cast_to` |
 | `cross_tu_support.cpp` | Support TU for the cross-translation-unit function test |
 
 ## Shared fixtures

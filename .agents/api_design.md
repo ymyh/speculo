@@ -45,6 +45,13 @@ v1 的实现即此顺序（`Method::invoke` / `Constructor::validate` / `Field::
 v2 要求：第 1–5 步有意的偏离（例如「先查能力再查类型」）必须在本文件对应章节写一行
 `检查顺序：…`，并在测试里按该顺序断言组合格子。未声明的顺序视为设计未完成。
 
+**v2 已实现部分（Phase 9）的检查顺序**：
+
+| API | 检查顺序 |
+|---|---|
+| `Class::new_aggregate` / 聚合伪 `Constructor::new_instance` | 能力（非聚合或某槽位不可初始化 → `NotSupported`）→ 实参个数（`InvalidArgument`）→ 逐参左到右（`TypeMismatch`） |
+| `Callable::invoke` / `invoke_ref` | 接收者是否适用（自由函数指针带接收者 → `NotSupported`）→ 实参个数 → 接收者（空 → `NullInstance`；类型 → `TypeMismatch`）→ 逐参左到右 |
+
 
 ## 1. 模板信息
 
@@ -89,6 +96,12 @@ public:
 
 新增 `TypeKind::Template`（枚举尾部追加，v1 取值不变）。
 
+> **S9 探针补充（GCC 16.2 实测）**：类类型的非类型实参（如 `Holder<int, 3, Config{7, 9}>`
+> 的 `Config`）在反射里是 **`is_object`** 而不是 `is_value`，但 `constant_of` + `extract`
+> 照常可用，因此 `Kind::Value` 的判据是 `is_value || is_object`；`as_value()` 的产物类型
+> 就是 `type_of(arg)` 去掉顶层 cv（`const Config` → `Config`）。取不到值的实参（指针 /
+> 成员指针）`as_value()` 返回 `None`，与注解值的可读性规则一致。
+
 > **spike S8.1 结论（GCC 16.2 实测）**
 > - `std::vector<int>` 有 **2** 个实参（`int` + 默认的 `std::allocator<int>`），不是 1 个；
 >   「按位置取类型实参」的示例要以真实实参表为准。
@@ -118,8 +131,16 @@ const Class& a = class_of<std::array<int, 3>>();
 a.get_template_arguments()[1].as_value().unwrap().as<int>(); // 3
 ```
 
-`Function` 同步获得同一组三个查询（`function_of<my_ns::id<int>>()` 能取到 `int`）；
+`Function` 同步获得同一组查询（`function_of<my_ns::id<int>>()` 能取到 `int`）；
 `Function` 与 `Class` 共用 `TemplateArgument`。
+
+> **实现偏差（Phase 9）**：`Function` 侧只有 `is_template_specialization()` /
+> `get_template_arguments()` / `get_template_argument_type()`，**没有** `get_primary_template()`。
+> 未实例化的函数模板没有形参类型，物化不出 `FunctionDesc`；若硬要返回，只能返回一个
+> 「函数模板的声明级 `Class`」，那会把 `Class` 的语义拉伸到函数模板上。`Class` 侧的
+> `get_primary_template()` 完整（`TypeKind::Template`，`size`/`alignment` 为 0、成员表为空）。
+> `is_template_specialization()` 只对**未加 cv/引用的类模板特化**为真：GCC 16.2 对
+> `const std::vector<int>` 也报模板实参（S9 探针实测），但按本节约定 cv 类型不是特化。
 
 ### 1.3 边界
 
@@ -194,6 +215,17 @@ public:
 实参匹配、返回值装箱、虚派发（成员函数指针走 `(obj->*fp)(...)` 时天然虚派发）与
 `Method::invoke` 完全一致。thunk 在物化**函数指针类型**时生成，随该类型的 bundle 一起。
 
+> **实现偏差（Phase 9）**
+> - `invoke(Args)` 与 `invoke(ObjectRef self, Args)`、`invoke_ref` 同理，**都要求写全实参**
+>   （接收者版本没有默认的 `Args`）：否则 `callable.invoke(ref)` 会在「一个实参」和
+>   「零实参 + 接收者」之间静默选错。
+> - C 可变参数的函数指针（`int (*)(int, ...)`）能描述（`get_function_type().is_variadic()`
+>   为真、只列固定形参），但 `is_invokable()` 为假、`invoke` 返回 `NotSupported`，与
+>   `Method` 的规则一致。
+> - `self` 必须是**声明类本身**（与 `Method` 同一条规则）；不做派生到基类的指针调整，
+>   需要时先 `cast_to`。
+> - `operator==` 比较「指针类型 + 指针值的字节」，因此两块不同存储里的同一个函数相等。
+
 ### 2.4 边界
 
 - 不解析 lambda 的闭包（无 RTTI、无标准手段），只处理裸函数指针/成员指针。
@@ -236,6 +268,13 @@ public:
 - 实参个数必须覆盖全部初始化项 → 少于 → `InvalidArgument`。默认成员初始化器
   （`int x = 5;`）在「被跳过」时由编译器生效，但本 API 要求写全，不模拟跳过。
 - 数组类型、引用成员、`const` 成员按语言规则处理，不可初始化 → `NotSupported`。
+- 检查顺序：能力（非聚合 / 某槽位不可初始化 → `NotSupported`）→ 个数 → 逐参左到右。
+
+> **实现偏差（Phase 9）实测**：`const` 成员与 `T&` 成员**可以**按位置初始化（分别是
+> 拷贝初始化和引用绑定），数组成员与 `T&&` 成员不行（聚合初始化不允许从数组左值拷贝，
+> 也不允许左值绑到右值引用）；联合体虽然 `is_aggregate_type` 为真，但聚合初始化只填一个
+> 成员、没有「按位置」的清单，因此同样返回 `NotSupported`。`Class::is_aggregate()` 仍是
+> 语言层面的判定，不受这条限制影响。
 
 > **spike S8.6 结论（GCC 16.2 实测）**
 > - 初始化项序列 = `bases_of`（按 `is_public && !is_virtual` 过滤，声明序）+ `nonstatic_data_members_of`，
@@ -306,17 +345,27 @@ public:
     // —— 布局 ——
     bool is_standard_layout() const;
     bool has_unique_object_representations() const;
-    bool is_layout_compatible(const Class& other) const;
-    bool is_pointer_interconvertible_with(const Class& base) const;  // 同 is_pointer_interconvertible_base_of
-
     // —— 库合成（无对应标准 trait）——
     bool is_bit_castable_to(const Class& other) const;   // 同 size 且双方 trivially copyable
-
-    // —— 转换 ——
-    bool is_convertible_to(const Class& other) const;
-    bool is_nothrow_convertible_to(const Class& other) const;
 };
+
+// —— 转换与两个「双类型」谓词（自由函数模板，见下）——
+template <typename A, typename B> bool is_layout_compatible();
+template <typename Derived, typename Base> bool is_pointer_interconvertible_with();
+template <typename From, typename To> bool is_convertible_to();
+template <typename From, typename To> bool is_nothrow_convertible_to();
 ```
+
+> **实现偏差（Phase 9）：4 个双类型谓词是自由函数模板，不是 `Class` 的成员。**
+> 编译器 trait（`is_layout_compatible_type` / `is_pointer_interconvertible_base_of_type` /
+> `is_convertible_type` / `is_nothrow_convertible_type`）要求**两个**类型都是编译期类型；
+> 运行期的 `const Class&` 无法还原成模板实参（本库无 RTTI），物化期也不可能枚举所有类型对。
+> 成员形式 `cls.is_layout_compatible<U>()` 同样不行——`this` 指向的 `Class` 不带类型。
+> 因此两者都作为模板参数：`speculo::is_convertible_to<From, To>()`，结果与 `std::is_*_v`
+> 逐位相同（测试里做交叉验证）。操作数顺序：`is_pointer_interconvertible_with<Derived, Base>`
+> 与 `get_bases()` 一致，内部转成 `std::meta` 的 `(base, derived)`（S8.10 顺序陷阱）。
+> 单类型谓词仍是 `Class` 成员（物化期求值、存成位）；`is_bit_castable_to` 也留在成员上，
+> 因为它只需要两侧的尺寸与能力位，运行期可算。
 
 谓词全部在物化期求值，存成 `TypeDescriptor` 的位；运行期是一次位测试。
 非类类型上调用返回 `false`（不 panic），文档标注。
@@ -360,6 +409,13 @@ struct BaseClass {
 实现：物化时为每条基类关系生成 `offset_fn(void*) -> std::size_t`（就是 `cast` thunk
 减一次指针差），非虚基在常量传播下退化为立即数。虚基没有静态偏移，仍只能走
 `Class::cast_to`。v1「不暴露 offset」的理由（虚基无静态偏移）在区分虚/非虚后不再成立。
+
+> **实现偏差（Phase 9，更简单）：偏移是物化期常量，thunk 不需要 `void*` 形参。**
+> S9 探针实测 GCC 16.2 的 `std::meta::offset_of` 直接接受**基类反射**
+> （`offset_of(bases_of(C)[i]).bytes` 给出 0 / 4 / 8 等真实偏移），所以
+> `BaseClass::offset` 是一个返回常量的 `std::size_t (*)()` thunk，`get_offset()` 调用它；
+> 虚基与 protected/private 基的 thunk 为 `nullptr`，`get_offset()` 返回 `None`。
+> 测试用「常量偏移 == `cast_to` 的实际地址差」做两路一致性校验（含虚基 `None` 的对照）。
 
 > **spike S8.10 结论（GCC 16.2，`-O2` 汇编核对）**
 > - 非虚基 thunk 编译成 `leaq 4(%rcx), %rax`（一条 `lea` + 空指针保护），偏移是立即数；

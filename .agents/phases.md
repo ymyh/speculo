@@ -14,12 +14,13 @@
 `Enumerator` / `BaseClass` / `Array` / `Modifier`、双视图成员访问、三级查找、继承与 `cast_to`、
 注册表与 `SPECULO_IMPL` 家族。CMake 与 xmake 双系统全绿。
 
-**测试现状**：222 个用例（CMake 全绿，`ctest` 5/5）。v1 的测试已按 @.agents/testing.md §2–§5 对齐，
-**7 张组合矩阵**覆盖 `Method::invoke`（5 × 5）、`Field::set`（5 × 5）、`Class::get_method`（5 × 4）、
-`Constructor::new_instance`（5 × 5）、`Array` 操作（5 × 4 + Option 列）、`cast_to`（5 × 2）、
-枚举三向互转（4 × 6），`Function` 侧的 6 张沿用；错误优先级（api_design §0.1）由矩阵中
-「同时两个错」的格子钉住。前 3 张的期望值由 `tools/gen_matrix.py` 枚举生成，其余按行内数据表。
-7 个句柄各自的「空句柄 → `panic`」死亡用例也已补齐（共 13 个 `EXPECT_DEATH`，
+**测试现状**：268 个用例（CMake 全绿，`ctest` 5/5；xmake 同样 5/5）。v1 的测试已按
+@.agents/testing.md §2–§5 对齐，**7 张组合矩阵**覆盖 `Method::invoke`（5 × 5）、`Field::set`
+（5 × 5）、`Class::get_method`（5 × 4）、`Constructor::new_instance`（5 × 5）、`Array` 操作
+（5 × 4 + Option 列）、`cast_to`（5 × 2）、枚举三向互转（4 × 6），`Function` 侧的 6 张沿用；
+Phase 9 又加了 `Callable::invoke` 的接收者 × 实参表。错误优先级（api_design §0.1）由矩阵中
+「同时两个错」的格子钉住。前 3 张的期望值由 `tools/gen_matrix.py` 枚举生成，其余按行内
+数据表。9 个句柄各自的「空句柄 → `panic`」死亡用例也已补齐（共 15 个 `EXPECT_DEATH`，
 约占 9 s 跑时，属预期开销）。
 
 **工具链（硬约束，v2 不变）**
@@ -93,25 +94,32 @@
 `spikes/s8_*.cpp` 全部可独立编译运行。
 
 
-## Phase 9：类型系统建模（4~5 天）
+## Phase 9：类型系统建模（4~5 天）—— ✅ 已完成（2026-10-30）
 
 目标：把「类型是怎么构造出来的」补进描述层。对应 api_design §1–§6。
 
-- [ ] `TypeKind::Template` + `TemplateDesc`；`Class::is_template_specialization` /
-  `get_primary_template` / `get_template_arguments` / `get_template_argument_type`
-- [ ] `TemplateArgument`（`Kind::{Type, Value, Template, Pack}` + 四个 `as_*` + `get_spelling`）；
-  NTTP 值按参数类型装箱（复用 `Object` 的 `from_value`）
-- [ ] `Function` 同步获得模板查询（与 `Class` 共用 `TemplateArgument`）
-- [ ] 函数类型分解：`Class::get_return_type` / `get_parameter_types` / `get_parameter_count` /
+> 落地记录与 6 条实现偏差见 `review.md`「Phase 9」。三处与下文清单不同：
+> 4 个双类型谓词改为**自由函数模板**（运行期拿不到第二个类型），`Function` 只给
+> `is_template_specialization` + `get_template_arguments`（没有主模板），`BaseClass::get_offset`
+> 的偏移是物化期常量（`offset_of(基类)`，无需 `void*` thunk）。
+
+- [x] `TypeKind::Template` + 主模板的声明级描述（以 `meta::info` 为键的 `TemplateBundle`）；
+  `Class::is_template_specialization` / `get_primary_template` / `get_template_arguments` /
+  `get_template_argument_type`
+- [x] `TemplateArgument`（`Kind::{Type, Value, Template, Pack}` + 四个 `as_*` + `get_spelling`）；
+  NTTP 值按参数类型装箱（`constant_of` + `extract`）
+- [x] `Function` 同步获得模板查询（与 `Class` 共用 `TemplateArgument`；无 `get_primary_template`）
+- [x] 函数类型分解：`Class::get_return_type` / `get_parameter_types` / `get_parameter_count` /
   `is_variadic` / `is_noexcept`（仅 `kind() == Function`）
-- [ ] `Callable` + `CallableDesc`：函数指针 / 成员函数指针的 `invoke` / `invoke_ref`；
+- [x] `Callable` + `CallableDesc`：函数指针 / 成员函数指针的 `invoke` / `invoke_ref`；
   thunk 随函数指针类型的 bundle 生成
-- [ ] 聚合构造：`Class::new_aggregate` / `get_aggregate_initializer` / `Object::make_aggregate`；
+- [x] 聚合构造：`Class::new_aggregate` / `get_aggregate_initializer` / `Object::make_aggregate`；
   顺序 = public 基类（声明序）+ 本类非静态数据成员（声明序）
-- [ ] 嵌套类型：`Class::get_declared_classes` / `get_enclosing_class`（`nested_types` 表）
-- [ ] 布局与能力谓词：§5.2 全部 11 个，存为 `TypeDescriptor` 位；`is_bit_castable_to` 为库合成
-- [ ] 基类偏移：`BaseClass::get_offset` + `BaseDesc::offset_fn`
-- [ ] 测试：`tests/template_test.cpp` / `callable_test.cpp` / `aggregate_test.cpp` /
+- [x] 嵌套类型：`Class::get_declared_classes` / `get_enclosing_class`（`nested_types` 表）
+- [x] 布局与能力谓词：§5.2 全部 11 个（6 个单类型位 + `is_bit_castable_to` + 4 个双类型
+  自由函数模板），单类型谓词存为 `TypeDescriptor` 能力位
+- [x] 基类偏移：`BaseClass::get_offset`（物化期常量；虚基 / 不可访问基 → `None`）
+- [x] 测试：`tests/template_test.cpp` / `callable_test.cpp` / `aggregate_test.cpp` /
   `nested_type_test.cpp` / `layout_traits_test.cpp` / `base_offset_test.cpp`
 
 **验收**：`class_of<std::vector<int>>()` 能取到 `int`；`std::array<int,3>` 能取到 `3`；

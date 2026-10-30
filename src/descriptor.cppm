@@ -32,8 +32,36 @@ using NewArrayFn      = void* (*)(std::size_t);         ///< allocate E[n], retu
 using EnumReadFn      = std::uint64_t (*)(const void*); ///< read an enum object's underlying bits
 using EnumMakeFn      = void* (*)(std::uint64_t);       ///< heap-construct an enum from underlying bits
 using EnumBoxFn       = void* (*)(std::uint64_t);       ///< heap-construct the *underlying integer* from its bits
+using CallableInvokeFn    = void* (*)(const void* callable, void* self, const void* const* args);
+using CallableInvokeRefFn = const void* (*)(const void* callable, void* self, const void* const* args);
+using BaseOffsetFn        = std::size_t (*)(); ///< base subobject offset; nullptr when there is none
 
 struct TypeDescriptor;
+struct TemplateArgDesc;
+struct CallableDesc;
+
+/**
+ * @brief Bits of TypeDescriptor::capabilities (api_design §5.2)
+ *
+ * Every bit is evaluated while materializing the type, so a class-level query is
+ * one bit test at run time. A bit is only meaningful for class / union types;
+ * for everything else the whole set is 0 and the queries answer false.
+ */
+enum class Capability : std::uint32_t
+{
+    TriviallyCopyable             = 1u << 0,
+    TriviallyDefaultConstructible = 1u << 1,
+    TriviallyDestructible         = 1u << 2,
+    VirtualDestructor             = 1u << 3,
+    StandardLayout                = 1u << 4,
+    UniqueObjectRepresentations   = 1u << 5,
+};
+
+[[nodiscard]] constexpr auto has_capability(std::uint32_t bits, Capability bit) noexcept -> bool
+{
+    return (bits & static_cast<std::uint32_t>(bit)) != 0;
+}
+
 
 /**
  * @brief One materialized annotation value
@@ -164,6 +192,11 @@ struct FunctionDesc
     bool is_variadic = false;         ///< C-style `...`; only the fixed parameters are listed
     bool has_canonical_name = false;  ///< false for internal linkage: invokable, not registered
 
+    // ── Phase 9: templates ──
+    bool is_template_specialization = false; ///< `function_of<id<int>>()` is one
+    const void* template_arguments = nullptr; ///< const TemplateArgument[]
+    std::size_t template_argument_count = 0;
+
     InvokeFn invoke = nullptr;        ///< self is ignored; nullptr when the call cannot be made
     InvokeRefFn invoke_ref = nullptr; ///< reference-returning functions only
 
@@ -210,6 +243,49 @@ struct EnumDesc
 
     const void* annotations = nullptr; ///< const Annotation[]
     std::size_t annotation_count = 0;
+};
+
+/**
+ * @brief Runtime description of one template argument (Phase 9)
+ *
+ * One `kind` field selects which of the payload fields is meaningful:
+ *  - Type     -> `type` (the argument type itself)
+ *  - Value    -> `type` (the argument's declared type, cv stripped) + `value`
+ *                (nullptr when the value cannot be extracted on this compiler,
+ *                e.g. a pointer or member-pointer non-type argument)
+ *  - Template -> `primary_template` (the declaration-level descriptor)
+ *  - Pack     -> `pack` / `pack_count` (never produced by GCC 16.2)
+ */
+struct TemplateArgDesc
+{
+    TemplateArgumentKind kind = TemplateArgumentKind::Type;
+    std::string_view spelling; ///< the compiler's display string: "int" / "3" / "std::vector"
+
+    const TypeDescriptor* type = nullptr;             ///< Kind::Type / Kind::Value
+    const TypeDescriptor* primary_template = nullptr; ///< Kind::Template
+    const void* value = nullptr;                      ///< Kind::Value: static copy, nullptr when unreadable
+    const void* pack = nullptr;                       ///< Kind::Pack: const TemplateArgument[]
+    std::size_t pack_count = 0;
+};
+
+/**
+ * @brief Runtime description of a value whose type is a function pointer or a
+ *        member function pointer (api_design §2.3)
+ *
+ * `invoke` / `invoke_ref` take the pointer *value* (a pointer to the bytes of the
+ * `Object`) plus the receiver, so the same pair of thunks serves every value of
+ * that type.
+ */
+struct CallableDesc
+{
+    const TypeDescriptor* type = nullptr;                 ///< the pointer type itself, e.g. `void (*)(int)`
+    const TypeDescriptor* function_type = nullptr;        ///< the pointee function type, e.g. `void (int)`
+    const TypeDescriptor* declaring_class = nullptr;      ///< member pointers only: `C` in `R (C::*)(...)`
+    bool is_member_function_pointer = false;
+    bool returns_reference = false;
+
+    CallableInvokeFn invoke = nullptr;         ///< nullptr when the result cannot be boxed
+    CallableInvokeRefFn invoke_ref = nullptr;  ///< reference results only
 };
 
 /**
@@ -298,6 +374,29 @@ struct TypeDescriptor
     // ── element capabilities (Array) ──
     CopyAssignFn copy_assign = nullptr; ///< nullptr when not copy-assignable
     NewArrayFn   new_array = nullptr;   ///< nullptr when not default-constructible
+
+    // ── structure group (Phase 9) ──
+    const TypeDescriptor* primary_template = nullptr; ///< class template primary (kind == Template), when a specialization
+    const void* template_arguments = nullptr;         ///< const TemplateArgument[]
+    std::size_t template_argument_count = 0;
+
+    const TypeDescriptor* function_return = nullptr;  ///< function types only
+    const Class* const*   function_parameters = nullptr; ///< function types only (declared parameter types)
+    const TypeDescriptor* const* function_parameter_decays = nullptr; ///< cv/ref-normalized parameter types
+    std::size_t function_parameter_count = 0;
+    bool function_is_variadic = false; ///< C-style `...` (fixed parameters are still listed)
+    bool function_is_noexcept = false;
+
+    const Class* const* nested_types = nullptr; ///< const Class* const[]: classes / unions / enums declared inside
+    std::size_t nested_type_count = 0;
+    const TypeDescriptor* enclosing_class = nullptr; ///< the class this type is declared in, if any
+
+    const void* aggregate_initializer = nullptr; ///< const Constructor* (pseudo-constructor), aggregate types only
+
+    // ── capability group (Phase 9) ──
+    std::uint32_t capabilities = 0; ///< Capability bits; 0 for non-class types
+
+    const CallableDesc* callable = nullptr; ///< function pointer / member function pointer types only
 };
 
 // ─────────────────────────────────────────────────────────────────────────────

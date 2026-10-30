@@ -163,6 +163,23 @@ enum class TypeKind
     Class,
     Function,
     Reference, ///< T& / T&& (distinct from the referred object type)
+    /// A class/function template *primary* (declaration-level: no size, no members).
+    /// Instances are reached through Class::get_primary_template().
+    Template,
+};
+
+/**
+ * @brief What one template argument is (Class::get_template_arguments)
+ * @note Parameter packs are flattened by the reflection layer into independent
+ *       arguments, so Pack is never produced by GCC 16.2; the enumerator is kept
+ *       for forward compatibility (see @.agents/api_design.md §1.2).
+ */
+enum class TemplateArgumentKind
+{
+    Type,     ///< a type argument: std::vector<int> -> int
+    Value,    ///< a non-type argument: std::array<int, 3> -> 3
+    Template, ///< a template-template argument: Pack3<int, std::vector, 7> -> std::vector
+    Pack,     ///< a parameter pack (never produced by GCC 16.2)
 };
 
 } // namespace speculo

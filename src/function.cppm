@@ -62,6 +62,34 @@ public:
     /// still be invoked, but Function::for_name cannot name it.
     [[nodiscard]] auto has_canonical_name() const -> bool { return m_desc->has_canonical_name; }
 
+    /**
+     * @brief Whether this is one instantiation of a function template
+     * @note `function_of<id<int>>()` is a specialization; there is deliberately no
+     *       get_primary_template(): an uninstantiated function template has no
+     *       parameter types, so it cannot be described by a Function (see
+     *       @.agents/api_design.md §1.2 and @.agents/review.md「Phase 9」).
+     */
+    [[nodiscard]] auto is_template_specialization() const -> bool { return m_desc->is_template_specialization; }
+
+    /// Template arguments in declaration order, defaulted arguments included.
+    [[nodiscard]] auto get_template_arguments() const -> std::span<const TemplateArgument>
+    {
+        return std::span<const TemplateArgument>(static_cast<const TemplateArgument*>(m_desc->template_arguments),
+                                                 m_desc->template_argument_count);
+    }
+
+    /// The argument at `index` when it is a *type* argument; None otherwise.
+    [[nodiscard]] auto get_template_argument_type(std::size_t index) const -> Option<const Class&>
+    {
+        const std::span<const TemplateArgument> arguments = get_template_arguments();
+        if (index >= arguments.size() || arguments[index].kind() != TemplateArgumentKind::Type)
+        {
+            return None{};
+        }
+
+        return arguments[index].as_type();
+    }
+
     /// Registry key. The compiler's display string, with " noexcept" appended when
     /// the function is noexcept (the display string itself leaves that out).
     [[nodiscard]] auto get_signature() const -> std::string_view { return m_desc->signature; }
@@ -262,6 +290,20 @@ namespace meta = std::meta;
 template<meta::info F, std::size_t J>
 using free_parameter_type = typename[: meta::type_of(meta::parameters_of(F)[J]) :];
 
+/// Template arguments of a function template specialization (0 for a plain function).
+template<meta::info F>
+consteval auto function_template_argument_count() -> std::size_t
+{
+    if constexpr (meta::is_function(F) && meta::has_template_arguments(F))
+    {
+        return meta::template_arguments_of(F).size();
+    }
+    else
+    {
+        return 0;
+    }
+}
+
 template<meta::info F, std::size_t... I>
 consteval auto make_free_invoker(std::index_sequence<I...>) -> InvokeFn
 {
@@ -311,6 +353,7 @@ consteval auto make_function_desc(const Class* const* parameters, const TypeDesc
     desc.is_operator = meta::is_operator_function(F);
     desc.is_variadic = meta::is_vararg_function(F);
     desc.has_canonical_name = has_canonical_name(F);
+    desc.is_template_specialization = meta::has_template_arguments(F);
 
     if (meta::has_parent(F))
     {
@@ -403,6 +446,8 @@ struct FreeFunctionBundle
     std::array<const TypeDescriptor*, parameter_count> parameter_decays{};
     std::array<const Annotation*, parameter_count> empty_annotations{};
     std::array<std::size_t, parameter_count> empty_counts{};
+    std::array<TemplateArgDesc, function_template_argument_count<F>()> template_arg_descs{};
+    std::array<TemplateArgument, function_template_argument_count<F>()> template_arg_handles{};
     FunctionDesc desc{};
     Function handle{};
 };
@@ -433,6 +478,43 @@ inline constexpr FreeFunctionBundle<F> free_function_bundle = []() consteval -> 
                                        free_function_bundle<F>.parameter_decays.data(),
                                        free_function_bundle<F>.empty_annotations.data(),
                                        free_function_bundle<F>.empty_counts.data());
+
+    // Template arguments (Phase 9): materialized next to the signature so that
+    // `function_of<id<int>>()` can report `int`.
+    [&built]<std::size_t... K>(std::index_sequence<K...>)
+    {
+        (([&built]()
+        {
+            constexpr meta::info A = template_argument_info<F, K>();
+            constexpr TemplateArgumentKind kind = template_argument_kind<A>();
+
+            TemplateArgDesc arg{};
+            arg.kind = kind;
+            arg.spelling = std::define_static_string(meta::display_string_of(A));
+            if constexpr (kind == TemplateArgumentKind::Type)
+            {
+                arg.type = std::addressof(bundle<typename[: A :]>.desc);
+            }
+            else if constexpr (kind == TemplateArgumentKind::Template)
+            {
+                arg.primary_template = std::addressof(template_bundle<A>.desc);
+            }
+            else if constexpr (kind == TemplateArgumentKind::Value)
+            {
+                using ValueType = std::remove_cv_t<typename[: meta::type_of(A) :]>;
+                arg.type = std::addressof(bundle<ValueType>.desc);
+                arg.value = template_argument_value<A>();
+            }
+
+            built.template_arg_descs[K] = arg;
+            built.template_arg_handles[K] =
+                Access::make<TemplateArgument>(std::addressof(free_function_bundle<F>.template_arg_descs[K]));
+        }()), ...);
+    }(std::make_index_sequence<function_template_argument_count<F>()>{});
+
+    built.desc.template_arguments = free_function_bundle<F>.template_arg_handles.data();
+    built.desc.template_argument_count = function_template_argument_count<F>();
+
     built.handle = Access::make<Function>(std::addressof(free_function_bundle<F>.desc));
 
     return built;
