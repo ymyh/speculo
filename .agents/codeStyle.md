@@ -113,7 +113,23 @@ int& ref = ...;
 - Template parameters: `PascalCase` for types (`T`, `Args`, `Self`, `F`).
 - Namespaces: `snake_case` — `speculo`, `detail`.
 - Macros: `SCREAMING_SNAKE_CASE` with the `SPECULO_` prefix where applicable —
-  `SPECULO_IMPL`, `SPECULO_IMPL_VIRTUAL`, `SPECULO_REGISTER`.
+  `SPECULO_IMPL`, `SPECULO_IMPL_VIRTUAL`, `SPECULO_REGISTER`, `SPECULO_DEEP`.
+
+### API vocabulary and shape (Java words, C++ spelling)
+
+- **Types use PascalCase** (Java style): `Class` / `Field` / `Method` /
+  `ObjectRef` / `Constructor`.
+- **Methods and free functions use snake_case**: `get_name` /
+  `get_declared_fields` / `new_instance`. The vocabulary is taken directly from
+  `java.lang.reflect`, but the spelling follows the C++ underscore convention.
+- All public API lives in namespace `speculo` and is consumed via
+  `import speculo;`. Free-function entry points are `snake_case`
+  (`class_of<T>()`, `function_of<f>()`, `overload_of<...>(f)`).
+- `Option` / `Result` mean `crab_cpp::Option` / `crab_cpp::Result`, re-exported
+  as aliases by the `speculo` module (`Status` = `Result<std::monostate, Error>`,
+  `Outcome<T>` = `Result<T, Error>`).
+- Handles (`Class`, `Field`, `Method`, ...) are cheap copyable values pointing
+  into constexpr tables; they never own anything and never throw.
 
 ## Functions and declarations
 
@@ -174,7 +190,8 @@ export import :registry;
 ```
 
 - Module partition names are single lowercase words (`error`, `modifier`,
-  `descriptor`, `object`, `function`, `registry`), matching @.agents/design.md §4
+  `descriptor`, `object`, `function`, `registry`; `compile` is planned for the
+  compile-time half, see @.agents/design.md §14), matching @.agents/design.md §4
   and the actual partition layout (see @.agents/review.md "Phase 3" for why
   `:type` / `:field` / `:method` converge into `:object`).
 - Put public API in `export namespace speculo { ... }`. Internal implementation
@@ -226,7 +243,7 @@ Args(Ts&... objs)
 ## Error handling
 
 - No exceptions for error reporting: lookups return `Option<T>`, operations
-  return `Result<T, Error>` / `Status` (see @.agents/api_design.md §1).
+  return `Result<T, Error>` / `Status` (see @.agents/design.md §6).
 - `crab_cpp::panic` is reserved for programmer errors only (violated
   preconditions, e.g. calling `Object::type()` on an empty object), never for
   regular error paths.
@@ -235,6 +252,14 @@ Args(Ts&... objs)
 
 - Tests live in `tests/*.cpp`, use GoogleTest, and `import speculo;`.
 - Name test cases `TEST(SuiteName, CaseName)` with `PascalCase`, e.g.
-  `TEST(FieldTest, GetSetIntMember)`.
+  `TEST(FieldTest, GetSetIntMember)`. Matrix-style cases use `TEST_F` with a
+  fixture; shared fixture types live in `tests/support/*.h`.
 - Use `EXPECT_*` assertions; `EXPECT_DEATH` only for panic paths (see the
   error-handling rules above).
+- Assert on `ErrorKind`, not on `Error::message` text (only
+  `error_message_test.cpp` owns the text).
+- Every API with more than one parameter keeps its **value-class matrix table**
+  at the top of the test file (format in @.agents/testing.md §6); the table and
+  the cases must stay in sync.
+- Strategy, coverage model and the v2-specific techniques are in
+  @.agents/testing.md; the file-to-API map is in `tests/README.md`.

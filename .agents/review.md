@@ -509,3 +509,81 @@ method.invoke(obj, {std::string("x")});   // 不能编译
 - 私有/保护构造在命名空间作用域的 thunk 里没有访问权，不能 `new_instance`（私有方法和私有字段可以，这是不对称，但是访问模型决定的，除非改用类内 friend thunk）。
 - `&&` 限定的成员函数没有值类别可用，`invoke` 保持不支持，直到 `ObjectRef` 能表达值类别。
 - 别名类型反射到底层类型，`using` 信息丢失。
+
+---
+
+## 8. Phase 8：v2 风险前置 spike 结论（2026-10-30）
+
+环境：MSYS2 ucrt64 **GCC 16.2.0**，`-std=c++26 -freflection -fno-rtti -fno-exceptions`。
+12 个探针 `spikes/s8_*.cpp` 全部独立编译运行（`pwsh -File spikes/run.ps1 <file>`），
+`-Wall -Wextra` 下 **0 warning**。逐项结论如下；凡 ⚠️ / ❌ 均已回写 `api_design.md`。
+
+| 项 | 结论 | 关键事实 |
+|---|---|---|
+| S8.1 模板 | ✅ | 类型实参 / NTTP / template-template / 包 四类都能取；`substitute` 四类全部往返成功 |
+| S8.2 布局谓词 | ✅ | 九个谓词全在，但统一带 **`_type`** 后缀；与 `std::is_*_v` 20 余处交叉验证一致 |
+| S8.3 虚析构 | ⚠️ | 谓词存在且 11/11 与编译器一致；但 `api_design` §5.3 原第 2 条推导**是错的**，已改文档 |
+| S8.4 函数类型 | ⚠️ | 函数类型 ✅；**成员函数指针类型不能被反射分解**（三个 API 都抛 `std::meta::exception`） |
+| S8.5 嵌套类型 | ✅ | `parent_of` 完整；分类必须先判别名，别名的 `is_class_type` 已穿透 |
+| S8.6 聚合构造 | ✅ | consteval / 运行期共用一份 splat thunk；基类槽位是**基类对象**不是成员 |
+| S8.7 值类别 | ✅ | `&` / `&&` 可区分，`(std::move(*p).*fp)()` 右值语义确实保留（源对象被搬空） |
+| S8.8 存储期 | ✅ | 无 `is_thread_local`，对应谓词是 `has_thread_storage_duration`；`THREAD_LOCAL` 可真正置位 |
+| S8.9 编译期遍历 | ✅ | `template for` 在用户 TU 可用；128 字段遍历净开销约 +0.23 s |
+| S8.10 基类偏移 | ✅ | 非虚基 thunk = 一条 `lea` + 立即数；虚基必须读 vtable，且同一虚基偏移随完整对象变化 |
+
+### 8.1 必须带进 Phase 9 的事实（按风险排序）
+
+1. **成员函数指针类型无法分解（S8.4）**。`is_member_function_pointer_type` 可用，但
+   `return_type_of` / `parameters_of` / `parent_of` 对 `^^M (C::*)(A...)` 全部抛
+   `std::meta::exception`（「does not represent a function or function type with a return type」/
+   「... entity with parent」）。取 `C` 与函数类型只有两条路：
+   ① 从**成员函数反射**取 `parent_of` + `type_of`（限定符全保留），再 `extract<F C::*>`；
+   ② 对 MFP **类型**用 v1 已有的 `member_pointer_class<M C::*>` 类型级 trait
+   （`src/object.cppm`）。`Callable` 两条都要用，已写入 `api_design` §2.2。
+2. **`is_virtual_base_of_type` / `is_base_of_type` 的实参顺序是 `(base, derived)`**（S8.10），
+   与 `std::is_*_v<Base, Derived>` 一致，与「先派生后基类」的直觉相反。写反不会报错，只会静默取反。
+3. **`api_design` §5.3 第 2 条是错的（S8.3）**：「`is_polymorphic()` 为真 ⇒ 析构为虚」不成立
+   （`struct P { virtual void f(); };` 的析构不是虚的，这正是 `-Wdelete-non-virtual-dtor`）。
+   谓词本身可用（11/11 一致），直接用谓词；若将来要降级路径，正确规则是「用户声明虚析构 ||
+   任一基类（递归）有虚析构」。另注：`members_of` 对**隐式虚析构**报 `is_virtual() == false`。
+4. **NTTP 取值必须按 `type_of(arg)` 装箱（S8.1）**：`std::array<int,3>` 的 `3` 是
+   `unsigned long long`，`extract<int>` 会抛「value cannot be extracted」。
+5. **参数包被展平（S8.1）**：`std::tuple<int,char>` → 2 个独立实参，`Kind::Pack` 永不产生；
+   Phase 9 不要写 Pack 分支，文档统一写「包 = 多个实参」。
+6. **`std::vector<int>` 有 2 个实参**（`int` + `allocator<int>`）；`get_template_argument_type(0)`
+   的示例成立，但任何「参数个数 == 1」的假设都不成立。
+7. **主模板的命名（S8.1）**：`identifier_of(primary)` 给 `"vector"`（可用）；
+   `display_string_of(primary)` 是 `"template<class _Tp, class _Alloc> class std::vector"`，
+   不能当限定名——`get_qualified_name()` 必须走名字拼接。
+8. **别名分类顺序（S8.5）**：`using AliasToNested = Inner;` 的 `is_class_type` 已是 `true`，
+   必须先判 `is_type_alias` 再 `dealias`，否则别名会被当成类实体。
+9. **`members_of` 会返回隐式特殊成员，且 `has_identifier == false`**（S8.3/S8.4 顺带证实：
+   `struct { void f(); void g(...); }` 的 `members_of` 里 8 个 is_function，其中 6 个无名）。
+   取名字前必须 `has_identifier` 守门，否则 `identifier_of` 直接抛异常。
+10. **聚合初始化的槽位类型是基类本身（S8.6）**，不是基类的成员；`Ty{ B1{...}, int, double }` 合法，
+    `Ty{ 1, 2, 3 }` 不合法。C++20 起有私有非静态成员的类已不是聚合，`is_aggregate_type` 先挡一层。
+11. **`template for` 的范围必须是 constexpr**（S8.9）：反射范围要经
+    `std::define_static_array(...)` 提升，否则报「consteval-only variable `__for_range`」。
+12. **`consteval` 返回 `std::string` 的函数不可当运行期实参**（S8.9 复现）：
+    只能在 `static constexpr` / `define_static_string` 这类 manifestly constant-evaluated 上下文里用。
+
+### 8.2 探针清单
+
+| 文件 | 覆盖 |
+|---|---|
+| `spikes/s8_1_template.cpp` | 四类模板实参、`template_of` 三种命名、`substitute` 往返、NTTP 精确类型 |
+| `spikes/s8_2_layout.cpp` | 九个布局/转换谓词的可用性 + 与 `std::is_*_v` 交叉验证（含裸名反证） |
+| `spikes/s8_3_vdtor.cpp` | `has_virtual_destructor` 11 个类三方对照（谓词 / 编译器 / 新旧降级规则） |
+| `spikes/s8_4_function.cpp` | 函数类型分解、可变参、成员函数反射、MFP 类型不可分解的反证（`#if 0`） |
+| `spikes/s8_5_nested.cpp` | 嵌套类/联合/枚举/别名分类、`parent_of`、类模板实例内的嵌套类型 |
+| `spikes/s8_6_aggregate.cpp` | 初始化项顺序、`substitute` 出元组类型、consteval 与运行期同一 thunk |
+| `spikes/s8_7_value_category.cpp` | `&`/`&&` 谓词、两种 thunk、右值语义是否真保留（搬空验证） |
+| `spikes/s8_8_storage.cpp` | `has_thread_storage_duration` / `has_static_storage_duration` 互斥关系 |
+| `spikes/s8_9_traversal.cpp` | `template for` 四形态、128 字段 `define_aggregate` 遍历、splice 读写 |
+| `spikes/s8_9b_baseline.cpp` | S8.9 的编译耗时基线（1.74 s vs 1.96 s） |
+| `spikes/s8_10_base_offset.cpp` | 非虚/虚基偏移、EBO、同一虚基在不同完整对象里的偏移差 |
+| `spikes/s8_10b_offset_asm.cpp` | 用 volatile 函数指针挡住内联，供 `-O2 -S` 核对 thunk 代码生成 |
+
+验收口径达成：S8.1–S8.10 每项有结论，`spikes/s8_*.cpp` 全部可独立编译运行，
+⚠️ / ❌ 项（S8.3、S8.4）的偏差已写回 `api_design.md` §2.2 / §5.2 / §5.3。
+

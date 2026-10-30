@@ -23,6 +23,7 @@
 - API 详细设计：@.agents/api_design.md
 - 开发计划：@.agents/phases.md
 - 代码风格：@.agents/codeStyle.md
+- 测试策略：@.agents/testing.md（测试文件清单见 `tests/README.md`）
 - 审核反馈：@.agents/review.md
 - crab_cpp 依赖 API 偏差与升级适配：@.agents/crab_cpp_api_notes.md
 

@@ -220,3 +220,155 @@ speculo/
    成员函数里的 `= delete` 仍由类的成员表列出。内部链接（`static`、匿名命名空间）可以 `invoke`，
    但不进 `Function::for_name`。`consteval` 函数没有可用的 `<meta>` 谓词，点名可能直接编不过。
    成员函数仍走 `Method`。
+
+---
+
+# 第二部分：v2 设计
+
+> v1（§1–§11）解决的是「把 Java 反射搬到 C++」，已全部落地。v2 解决的是
+> 「Java 反射给不出、而 C++ 必须有的东西」。API 形态见 @.agents/api_design.md，
+> 排期见 @.agents/phases.md「Phase 8 起」。
+
+## 12. v2 定位：补上 C++ 的另一半
+
+v1 用 21 个修饰位、尺寸/偏移/位域、cv/引用分解，证明了「C++ 特有信息」这条路可行。
+但缺口集中在三处，性质不同：
+
+| 层 | 缺什么 | 为什么 v1 没覆盖 |
+|---|---|---|
+| 类型系统建模 | 模板实参、函数类型、聚合构造、嵌套类型、布局能力谓词 | v1 只建模了「对象类型」的**成员**，没建模「类型是怎么构造出来的」 |
+| 操作语义 | 值类别、移动、聚合初始化、默认实参、存储期 | v1 的对象模型借自 Java（引用 + 装箱值），移动语义无处安放 |
+| 工程化 | 编译期半层、零分配、分配器、跨 DSO 身份、诊断、关系图 | v1 的目标是「功能闭环」，不是「能上线」 |
+
+三条判据，任何 v2 特性都要过：
+
+1. **Java 给不出**（否则只是补作业）；
+2. **C++ 必须要**（否则是猎奇）；
+3. **无 RTTI / 无异常也能做**（否则违反 §1 的硬约束）。
+
+## 13. 描述层扩展：从「类型身份」到「类型结构」
+
+v1 的 `TypeDescriptor` 只回答「这是什么类型、有哪些成员」。v2 追加三组字段，
+仍然**扁平追加、不引入继承/变体/虚函数**：
+
+- **结构组**：`template_args` / `primary_template` / `function_return` / `function_params` /
+  `function_flags`（variadic, noexcept）/ `nested_types` / `enclosing`。
+- **能力组**：一组 `bool` 位（trivially_* / standard_layout / layout_compatible /
+  unique_object_representations / pointer_interconvertible / has_virtual_dtor /
+  convertible_to…）。求值全在物化期，运行期是位测试。
+- **操作组**：`move_ctor` / `move_assign` / `swap` / `destroy` / `offset_of_base` /
+  `invoke_into` 等新 thunk。约定不变：**nullptr = 能力缺失**。
+
+新增三个子描述：`TemplateDesc`（主模板的声明级信息）、`FunctionTypeDesc`（函数类型分解）、
+`CallableDesc`（值层可调用体：函数指针/成员指针的调用 thunk）。它们都由
+`TypeDescriptor` 用指针引用，不改变「句柄是指向描述项的 8/16 字节值」这一性质。
+
+两条铁律继续适用：
+
+- 所有跨类型的引用在 bundle 初始化器里必须用**依赖拼写**（`bundle<Arg>`），
+  禁止具体拼写（见 @.agents/review.md「Phase 4」雷区）。
+- 不再新增与 `:object` 互相引用的模块分区。`TemplateArgument` / `Callable` 并入 `:object`。
+
+**主模板的 `Class` 是声明级描述**：`TypeKind::Template`、size/alignment 为 0、成员表为空。
+理由：主模板的成员类型依赖模板参数，物化它等于物化一个不存在的类型；而 `substitute`
+出来的 `meta::info` 无法键在类型上（§2）。
+
+## 14. 编译期半层的分层位置
+
+v2 新增 `speculo:compile` 分区，放在分层图的最上层旁边，**不是中间**：
+
+```
+┌──────────────────────────────────────────────┐
+│ 编译期层  for_each_field / field_table /      │  ← 新：纯 constexpr，无运行期状态
+│           member_count（speculo:compile）     │
+├──────────────────────────────────────────────┤
+│ API 层    Class / Field / Method / …          │
+└──────────────────────────────────────────────┘
+```
+
+关键设计：**收集规则只有一份**。`detail` 里抽出一个纯 `std::meta` 的「成员视图」
+（`collect_fields<T>()` / `collect_methods<T>()`，返回 `std::array<meta::info, N>`），
+运行期物化与编译期遍历都消费它。这样「哪些成员可反射、访问如何过滤、`std` 如何浅物化」
+永远只有一处定义，不会两边漂移。
+
+为什么不把编译期层做成运行期 API 的快路径：运行期需要类型擦除（`void*` + 描述符），
+编译期需要类型保真（真实 `T&`）；合并会让两边都变慢，还会把 `meta::info` 拖进用户代码。
+二者是两条独立的路，共享同一个收集器。
+
+分区边界安全：`:compile` 只 `import std` + `<meta>`，**不 import `:object`**，
+因此不会形成 §4 铁律所指的强连通分量。代价是它不能复用 v1 的句柄类型；
+`FixedString` 需要随之下沉到一个不含反射的小分区，实现时定。
+
+## 15. 操作语义：值类别、移动、零分配
+
+### 15.1 值类别进 `ObjectRef`
+
+`ObjectRef` 现在 16 字节：`const void* data` + `const TypeDescriptor* type`，
+const/volatile 状态另存。v2 把 **value category** 放进同一批标志位，**布局不变**。
+
+- `ObjectRef::as_rvalue()` 只是打标记，不搬数据。
+- `Method::invoke` 的默认语义不变（接收者左值）；新增 `invoke_rvalue` 走右值路径，
+  `&&` 限定的成员函数只在这条路径可用。
+- `T&&` 形参仍按右值转发（v1 行为），但从此**可解释**：转发的是 `Args` 里的右值视图。
+
+### 15.2 移动与对象操作
+
+新增 `MoveCtorFn` / `MoveAssignFn` / `SwapFn`，与 `CloneFn` / `ReleaseFn` 同一 ABI 风格
+（`void*(void*)` / `bool(void*, void*)`）。`Class::assign` / `swap` / `destroy` 是它们的
+薄包装；`Object::move_from` 是 `destroy + move_ctor` 的组合。
+
+不做 `Object` 的 SSO：内联存储要求每个 `Object` 携带「是否内联」标志与容量，
+并把 `ReleaseFn` 变成两种语义（释放堆块 / 调用内联析构），复杂度换不到确定收益。
+分配器（§15.3）覆盖同一需求。
+
+### 15.3 零分配与分配器
+
+- **零分配**靠 `InvokeIntoFn`（`self, args, dst`）：结果直接构造进调用方存储。
+  `invoke` 退化为 `allocate + invoke_into + dtor`。
+- **分配器**是线程局部的默认指针 + 每次调用可指定的 `Allocator&`。
+  `Object` 头里**不存** Allocator 指针，只存释放 thunk —— 省 8 字节，且让 arena
+  的「整体释放」语义自然成立（deallocate 可以是空操作）。
+- 默认路径（不设分配器）保持 `::operator new`，零额外分支。
+
+## 16. 身份：跨 DSO 与注册表 v2
+
+`Class::operator==` 从「指针相等」放宽为三分支：
+
+1. 描述符指针相等 → true（热路径）；
+2. 都不等但都有规范名 → 比 `normalized_name`；
+3. 否则 false。
+
+代价：最坏 O(名字长度)。因此同时提供 `get_type_id()`（FNV-1a + 冲突链，注册表分配），
+给「跨 DSO 做键」的场景一个整数比较。文档必须写死：**身份统一 ≠ thunk 通用**——
+A 库物化出的 `Field` 用在 B 库构造的对象上，依赖两边布局与调用约定一致。
+
+注册表 v2 加**反向边索引**（base → derived），插入时维护。这让
+`get_derived_classes()` / `get_overrider_methods()` 成为 O(1) 取列表。同时必须在所有
+相关 API 上写明口径：**只覆盖已注册类型**。这是本库与 Java 最大的语义差异之一
+（Java 的 `Class` 全知），含糊过去会变成用户踩不完的坑。
+
+## 17. 物化成本与闭包控制
+
+v1 的成本源有三个，v2 全部放大：
+
+| 成本源 | v1 表现 | v2 放大点 | 控制手段 |
+|---|---|---|---|
+| `std` 签名闭包 | 一个 `std::string` 成员会拖进整棵 `basic_string` | 深物化白名单 | 默认浅物化不变；`SPECULO_DEEP(T)` 显式开启，不传播 |
+| 成员函数体实例化 | 物化会实例化成员函数体（§11.8） | 模板特化更多，闭包更大 | 保持 `reflect_impl_tag` 式注解排除；新增类型照此办理 |
+| 模板实参递归 | 无 | `map<string, vector<int>>` 会连带物化多个类型 | 只物化「实参类型本身」，不物化其成员（除非它是用户类型且被显式 `class_of`） |
+
+新增一条编译期护栏：单个类型的成员数 / 模板实参数超过阈值（默认 512 / 32）时
+`static_assert` 失败，消息里带类型名，提示 `SPECULO_DEEP` 或拆分类型。目的是把
+「编译一晚上」变成「编译时一句话」。
+
+## 18. 兼容性与迁移
+
+- **源码级兼容**，不承诺二进制兼容（模块 + `constexpr` 表，本来也没有 ABI 契约）。
+- 唯一语义变更：`Class::operator==` 放宽。把 `Class` 当 `std::unordered_map` 键的代码
+  需要改哈希（用 `get_type_id()`）；v2 不提供 `operator<`，有序容器同样建议用 id。
+- 新增枚举值（`TypeKind::Template`）与修饰位（`THREAD_LOCAL` … `VARIADIC`）只追加，
+  v1 取值不变。
+- 构建系统对等要求不变：新分区 `speculo:compile` 必须同时进 `CMakeLists.txt` 的
+  `CXX_MODULES` 文件集与 `xmake.lua` 的 target 源文件（@AGENTS.md）。
+- v2 完成后的定位一句话：**运行期可枚举、编译期可展开、跨 DSO 可识别，且不需要 RTTI
+  与异常**——这四件事 Java 一件也做不到，RTTI 方案也一件也做不到。
