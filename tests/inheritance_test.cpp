@@ -275,3 +275,62 @@ TEST(InheritedMemberTest, InaccessibleBasesAreNotTraversed)
     EXPECT_EQ(closed.get_field_recursive("hb").unwrap_err().kind, speculo::ErrorKind::NotFound);
     EXPECT_EQ(closed.get_field_recursive("pb").unwrap_err().kind, speculo::ErrorKind::NotFound);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// cast_to matrix: target base × receiver constness
+//
+// 5 targets × 2 constnesses = 10 cells. Only public paths are reachable — a
+// private or protected base has no cast thunk — and the receiver's constness is
+// carried into the result.
+// ─────────────────────────────────────────────────────────────────────────────
+
+TEST(CastMatrix, TargetBaseByConstness)
+{
+    Closed       closed;
+    const Closed const_closed{};
+
+    struct Target
+    {
+        std::string_view      name;
+        const speculo::Class* type = nullptr;
+        // An inaccessible base is still a base: the cast is refused with
+        // NotSupported (the access level), not with TypeMismatch.
+        speculo::ErrorKind    expected_kind = speculo::ErrorKind::TypeMismatch;
+        bool                  reachable = false;
+    };
+
+    const std::array<Target, 5> targets{{
+        { "Root",          std::addressof(speculo::class_of<Root>()),          speculo::ErrorKind::TypeMismatch, true },
+        { "HiddenBase",    std::addressof(speculo::class_of<HiddenBase>()),    speculo::ErrorKind::NotSupported, false },
+        { "ProtectedBase", std::addressof(speculo::class_of<ProtectedBase>()), speculo::ErrorKind::NotSupported, false },
+        { "self",          std::addressof(speculo::class_of<Closed>()),        speculo::ErrorKind::TypeMismatch, true },
+        { "Unrelated",     std::addressof(speculo::class_of<Unrelated>()),     speculo::ErrorKind::TypeMismatch, false },
+    }};
+
+    constexpr std::array<bool, 2> kConstnesses{ false, true };
+
+    for (const Target& target : targets)
+    {
+        for (const bool is_const : kConstnesses)
+        {
+            SCOPED_TRACE(std::format("{}/{}", target.name, is_const ? "const" : "mutable"));
+
+            const speculo::ObjectRef receiver =
+                is_const ? speculo::ObjectRef(const_closed) : speculo::ObjectRef(closed);
+            auto cast = speculo::class_of<Closed>().cast_to(receiver, *target.type);
+
+            if (target.reachable)
+            {
+                ASSERT_TRUE(cast.is_ok());
+                const speculo::ObjectRef view = cast.unwrap();
+                EXPECT_EQ(view.type(), *target.type);
+                EXPECT_EQ(view.is_const(), is_const);
+            }
+            else
+            {
+                ASSERT_TRUE(cast.is_err());
+                EXPECT_EQ(cast.unwrap_err().kind, target.expected_kind);
+            }
+        }
+    }
+}

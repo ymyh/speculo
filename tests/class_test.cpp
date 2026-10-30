@@ -158,3 +158,106 @@ TEST(InheritanceTest, GetSpecificBase)
     EXPECT_EQ(multi.get_base(speculo::class_of<Other>()).unwrap(), speculo::class_of<Other>());
     EXPECT_TRUE(multi.get_base(speculo::class_of<Leaf>()).is_none());
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// get_method matrix: lookup way × target
+//
+// 5 ways × 4 targets = 20 cells. Every way must agree on the four targets:
+// match -> Ok; missing name, wrong parameter type and wrong arity -> NotFound.
+// The declared way uses `Secret`, whose only method is private, so it also
+// proves the declared view reaches what the public view cannot.
+// ─────────────────────────────────────────────────────────────────────────────
+
+namespace
+{
+
+/// Overload set for the lookup matrix (kept local: `core_fixtures.h` and
+/// `instance_fixtures.h` both define `Widget`, so they cannot be combined).
+struct LookupTarget
+{
+    int base = 10;
+
+    auto only(int value) const -> int { return value; }
+    auto twice(int a, int b) const -> int { return a + b; }
+};
+
+} // namespace
+
+TEST(ClassMethodLookupMatrix, WayByTarget)
+{
+    const speculo::Class& mixed = speculo::class_of<LookupTarget>();
+    const speculo::Class& secret = speculo::class_of<Secret>();
+    const speculo::Class* int_cls = std::addressof(speculo::class_of<int>());
+    const speculo::Class* double_cls = std::addressof(speculo::class_of<double>());
+
+    struct Row
+    {
+        std::string_view label;
+        std::function<speculo::Result<speculo::Method, speculo::Error>()> lookup;
+        bool expected_ok = false;
+    };
+
+    const std::array<Row, 20> rows{{
+        // Class*: runtime pointer comparison.
+        { "ClassPtr/match",        [&] { return mixed.get_method("only", { int_cls }); }, true },
+        { "ClassPtr/missing-name", [&] { return mixed.get_method("nope", { int_cls }); }, false },
+        { "ClassPtr/wrong-params", [&] { return mixed.get_method("only", { double_cls }); }, false },
+        { "ClassPtr/wrong-arity",  [&] { return mixed.get_method("only", { int_cls, int_cls }); }, false },
+
+        // Type names: registry resolution, then the same pointer comparison.
+        { "TypeName/match",        [&] { return mixed.get_method("only", { "int" }); }, true },
+        { "TypeName/missing-name", [&] { return mixed.get_method("nope", { "int" }); }, false },
+        { "TypeName/wrong-params", [&] { return mixed.get_method("only", { "double" }); }, false },
+        { "TypeName/wrong-arity",  [&] { return mixed.get_method("only", { "int", "int" }); }, false },
+
+        // Template parameters: compile-time parameter list, runtime pointer compare.
+        { "Template/match",        [&] { return mixed.get_method<int>("only"); }, true },
+        { "Template/missing-name", [&] { return mixed.get_method<int>("nope"); }, false },
+        { "Template/wrong-params", [&] { return mixed.get_method<double>("only"); }, false },
+        { "Template/wrong-arity",  [&] { return mixed.get_method<int, int>("only"); }, false },
+
+        // Compile-time name as well.
+        { "TemplateName/match",        [&] { return mixed.get_method<"only", int>(); }, true },
+        { "TemplateName/missing-name", [&] { return mixed.get_method<"nope", int>(); }, false },
+        { "TemplateName/wrong-params", [&] { return mixed.get_method<"only", double>(); }, false },
+        { "TemplateName/wrong-arity",  [&] { return mixed.get_method<"only", int, int>(); }, false },
+
+        // Declared view: same targets against a private method.
+        { "Declared/match",        [&] { return secret.get_declared_method<>("secret_method"); }, true },
+        { "Declared/missing-name", [&] { return secret.get_declared_method<>("nope"); }, false },
+        { "Declared/wrong-params", [&] { return secret.get_declared_method<int>("secret_method"); }, false },
+        { "Declared/wrong-arity",  [&] { return secret.get_declared_method<int, int>("secret_method"); }, false },
+    }};
+
+    for (const Row& row : rows)
+    {
+        SCOPED_TRACE(std::string(row.label));
+        auto result = row.lookup();
+        if (row.expected_ok)
+        {
+            ASSERT_TRUE(result.is_ok()) << row.label;
+        }
+        else
+        {
+            ASSERT_TRUE(result.is_err()) << row.label;
+            EXPECT_EQ(result.unwrap_err().kind, speculo::ErrorKind::NotFound) << row.label;
+        }
+    }
+
+    // The compile-time name form is the same handle as the runtime one.
+    EXPECT_TRUE((secret.get_declared_method<"secret_method">()).is_ok());
+    EXPECT_TRUE(secret.get_method<>("secret_method").is_err());
+}
+
+TEST(ClassTest, EmptyHandleComparesAndPanicsOnUse)
+{
+    const speculo::Class empty{};
+
+    // Comparison never dereferences the descriptor.
+    EXPECT_TRUE(empty == speculo::Class{});
+    EXPECT_FALSE(empty == speculo::class_of<Point>());
+
+    // Every accessor goes through CheckedDesc and stops the program instead of
+    // dereferencing null.
+    EXPECT_DEATH((void)empty.get_name(), "default-constructed");
+}

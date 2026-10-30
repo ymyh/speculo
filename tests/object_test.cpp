@@ -125,3 +125,18 @@ TEST(ObjectRefTest, CloneReferencesExistingObject)
     }
     EXPECT_EQ(Counter::destroyed, 2);
 }
+
+TEST(ObjectTest, EmptyHandlePanicsOnType)
+{
+    speculo::Object empty_object;
+    speculo::ObjectRef empty_ref;
+
+    EXPECT_TRUE(empty_object.is_null());
+    EXPECT_TRUE(empty_ref.is_null());
+    EXPECT_EQ(empty_object.raw_data(), nullptr);
+
+    // Reading the type of an empty handle is a precondition violation, not an
+    // error result.
+    EXPECT_DEATH((void)empty_object.type(), "empty object");
+    EXPECT_DEATH((void)empty_ref.type(), "null reference");
+}

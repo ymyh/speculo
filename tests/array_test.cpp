@@ -38,6 +38,8 @@ TEST(ArrayTest, StaticArrayAccess)
     int scalar = 0;
     EXPECT_EQ(speculo::Array::get_length(speculo::ObjectRef(scalar)).unwrap_err().kind,
               speculo::ErrorKind::TypeMismatch);
+    EXPECT_TRUE(speculo::Array::get_element_type(speculo::ObjectRef(scalar)).is_none());
+    EXPECT_TRUE(speculo::Array::get_element_type(speculo::ObjectRef{}).is_none());
 }
 
 TEST(ArrayTest, MultiDimensionalRankExtent)
@@ -311,4 +313,182 @@ TEST(ArrayTest, DynamicArrayOfTrackedElements)
         EXPECT_EQ(speculo::Array::get(ref, 0).unwrap().as<Tracked>().unwrap().v, 99);
     }
     EXPECT_EQ(Tracked::alive, 0); // all elements destroyed by the dynamic array
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// operation matrix: object form × operation
+//
+// 5 rows × 4 Result-returning operations = 20 cells, plus the Option-returning
+// `get_element_type` in the same loop. The interesting part is the order: `set`
+// rejects a const array before any bounds check, every operation on a null view
+// is NullInstance, and non-array objects are TypeMismatch everywhere.
+// ─────────────────────────────────────────────────────────────────────────────
+
+namespace
+{
+
+enum class ObjectForm { Mutable, Const, Volatile, Scalar, Null };
+enum class Operation { Length, Get, Set, GetRef };
+enum class Expected { Ok, NullInstance, TypeMismatch, ReadOnly, NotSupported };
+
+constexpr std::array<ObjectForm, 5> kObjectForms{
+    ObjectForm::Mutable,
+    ObjectForm::Const,
+    ObjectForm::Volatile,
+    ObjectForm::Scalar,
+    ObjectForm::Null,
+};
+
+constexpr std::array<Operation, 4> kOperations{
+    Operation::Length,
+    Operation::Get,
+    Operation::Set,
+    Operation::GetRef,
+};
+
+// 5 x 4 = 20 cells.
+//                  Length          Get              Set             GetRef
+constexpr std::array<std::array<Expected, 4>, 5> kArrayMatrix{{
+    /* Mutable  */ { Expected::Ok,           Expected::Ok,           Expected::Ok,           Expected::Ok },
+    /* Const    */ { Expected::Ok,           Expected::Ok,           Expected::ReadOnly,     Expected::Ok },
+    /* Volatile */ { Expected::Ok,           Expected::NotSupported, Expected::NotSupported, Expected::Ok },
+    /* Scalar   */ { Expected::TypeMismatch, Expected::TypeMismatch, Expected::TypeMismatch, Expected::TypeMismatch },
+    /* Null     */ { Expected::NullInstance, Expected::NullInstance, Expected::NullInstance, Expected::NullInstance },
+}};
+
+// `Array::get_element_type` for the same rows (it returns Option, not Result).
+constexpr std::array<bool, 5> kElementTypeIsSome{ true, true, true, false, false };
+
+[[nodiscard]] constexpr auto form_name(ObjectForm form) -> std::string_view
+{
+    switch (form)
+    {
+        case ObjectForm::Mutable:  return "mutable";
+        case ObjectForm::Const:    return "const";
+        case ObjectForm::Volatile: return "volatile";
+        case ObjectForm::Scalar:   return "scalar";
+        case ObjectForm::Null:     return "null";
+    }
+
+    return "?";
+}
+
+[[nodiscard]] constexpr auto form_name(Operation operation) -> std::string_view
+{
+    switch (operation)
+    {
+        case Operation::Length: return "length";
+        case Operation::Get:    return "get";
+        case Operation::Set:    return "set";
+        case Operation::GetRef: return "get_ref";
+    }
+
+    return "?";
+}
+
+[[nodiscard]] constexpr auto expected_kind(Expected expected) -> speculo::ErrorKind
+{
+    switch (expected)
+    {
+        case Expected::Ok:           return speculo::ErrorKind::NotFound;
+        case Expected::NullInstance: return speculo::ErrorKind::NullInstance;
+        case Expected::TypeMismatch: return speculo::ErrorKind::TypeMismatch;
+        case Expected::ReadOnly:     return speculo::ErrorKind::ReadOnly;
+        case Expected::NotSupported: return speculo::ErrorKind::NotSupported;
+    }
+
+    return speculo::ErrorKind::NotFound;
+}
+
+/// Runs one operation and normalizes it to "success or the error it reported".
+[[nodiscard]] auto run(Operation operation, const speculo::ObjectRef& object, int& nine) -> std::optional<speculo::Error>
+{
+    switch (operation)
+    {
+        case Operation::Length:
+        {
+            auto result = speculo::Array::get_length(object);
+            if (result.is_ok())
+            {
+                return std::nullopt;
+            }
+
+            return result.unwrap_err();
+        }
+        case Operation::Get:
+        {
+            auto result = speculo::Array::get(object, 0);
+            if (result.is_ok())
+            {
+                return std::nullopt;
+            }
+
+            return result.unwrap_err();
+        }
+        case Operation::Set:
+        {
+            auto result = speculo::Array::set(object, 0, speculo::ObjectRef(nine));
+            if (result.is_ok())
+            {
+                return std::nullopt;
+            }
+
+            return result.unwrap_err();
+        }
+        case Operation::GetRef:
+        {
+            auto result = speculo::Array::get_ref(object, 0);
+            if (result.is_ok())
+            {
+                return std::nullopt;
+            }
+
+            return result.unwrap_err();
+        }
+    }
+
+    std::abort();
+}
+
+} // namespace
+
+TEST(ArrayOperationMatrix, ObjectFormByOperation)
+{
+    int values[3] = { 1, 2, 3 };
+    static const int const_values[3] = { 4, 5, 6 };
+    volatile int volatile_values[3] = { 7, 8, 9 };
+    int scalar = 0;
+    int nine = 9;
+
+    const std::array<speculo::ObjectRef, 5> objects{
+        speculo::ObjectRef(values),
+        speculo::ObjectRef(static_cast<const void*>(const_values), speculo::class_of<const int[3]>()),
+        speculo::ObjectRef(volatile_values),
+        speculo::ObjectRef(scalar),
+        speculo::ObjectRef{},
+    };
+
+    for (std::size_t row = 0; row < kObjectForms.size(); ++row)
+    {
+        for (std::size_t column = 0; column < kOperations.size(); ++column)
+        {
+            SCOPED_TRACE(std::format("{}/{}", form_name(kObjectForms[row]), form_name(kOperations[column])));
+
+            const Expected expected = kArrayMatrix[row][column];
+            const std::optional<speculo::Error> error = run(kOperations[column], objects[row], nine);
+
+            if (expected == Expected::Ok)
+            {
+                ASSERT_FALSE(error.has_value());
+            }
+            else
+            {
+                ASSERT_TRUE(error.has_value());
+                EXPECT_EQ(error->kind, expected_kind(expected));
+            }
+        }
+
+        SCOPED_TRACE(std::format("{}/get_element_type", form_name(kObjectForms[row])));
+        EXPECT_EQ(speculo::Array::get_element_type(objects[row]).is_some(), kElementTypeIsSome[row]);
+    }
 }

@@ -228,3 +228,159 @@ TEST(ConstructorTest, MoveOnlyByValueParameterIsNotInvokable)
     int tag = 4;
     EXPECT_EQ(std::move(cls.new_instance({ tag }).unwrap()).as<Owner>().unwrap().tag, 4);
 }
+
+TEST(ConstructorTest, EmptyHandlePanicsOnUse)
+{
+    const speculo::Constructor empty{};
+
+    EXPECT_TRUE(empty == speculo::Constructor{});
+    EXPECT_DEATH((void)empty.get_parameter_count(), "default-constructed");
+    EXPECT_DEATH((void)empty.get_signature(), "default-constructed");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// new_instance matrix: constructor set × argument form
+//
+// 5 × 5 = 25 cells. Each row is a class whose constructor set differs in one
+// way; each column is an argument form. Expectations follow the documented
+// matching rules: exact types only, a deleted candidate -> NotSupported, a
+// private constructor invisible in the public view, nothing usable -> NotFound.
+// ─────────────────────────────────────────────────────────────────────────────
+
+namespace
+{
+
+struct CtorEmpty
+{
+};
+
+struct CtorInt
+{
+    int v = 0;
+
+    explicit CtorInt(int value) : v(value) {}
+};
+
+struct CtorPair
+{
+    int    a = 0;
+    double b = 0;
+
+    CtorPair(int first, double second) : a(first), b(second) {}
+};
+
+struct CtorDeleted
+{
+    int v = 0;
+
+    CtorDeleted() = default;
+    CtorDeleted(int) = delete;
+};
+
+struct CtorPrivate
+{
+    int v = 0;
+
+private:
+    explicit CtorPrivate(int value) : v(value) {}
+};
+
+enum class ArgumentForm { None, IntLvalue, IntLiteral, Double, Pair };
+enum class Expected { Ok, NotFound, NotSupported };
+
+constexpr std::array<ArgumentForm, 5> kArgumentForms{
+    ArgumentForm::None,
+    ArgumentForm::IntLvalue,
+    ArgumentForm::IntLiteral,
+    ArgumentForm::Double,
+    ArgumentForm::Pair,
+};
+
+// 5 x 5 = 25 cells.
+//                    None          IntLvalue       IntLiteral      Double        Pair
+constexpr std::array<std::array<Expected, 5>, 5> kNewInstanceMatrix{{
+    /* CtorEmpty   */ { Expected::Ok,           Expected::NotFound,     Expected::NotFound,     Expected::NotFound, Expected::NotFound },
+    /* CtorInt     */ { Expected::NotFound,     Expected::Ok,           Expected::Ok,           Expected::NotFound, Expected::NotFound },
+    /* CtorPair    */ { Expected::NotFound,     Expected::NotFound,     Expected::NotFound,     Expected::NotFound, Expected::Ok },
+    /* CtorDeleted */ { Expected::Ok,           Expected::NotSupported, Expected::NotSupported, Expected::NotFound, Expected::NotFound },
+    /* CtorPrivate */ { Expected::NotFound,     Expected::NotFound,     Expected::NotFound,     Expected::NotFound, Expected::NotFound },
+}};
+
+[[nodiscard]] constexpr auto form_name(ArgumentForm form) -> std::string_view
+{
+    switch (form)
+    {
+        case ArgumentForm::None:       return "none";
+        case ArgumentForm::IntLvalue:  return "int-lvalue";
+        case ArgumentForm::IntLiteral: return "int-literal";
+        case ArgumentForm::Double:     return "double";
+        case ArgumentForm::Pair:       return "pair";
+    }
+
+    return "?";
+}
+
+[[nodiscard]] constexpr auto expected_kind(Expected expected) -> speculo::ErrorKind
+{
+    switch (expected)
+    {
+        case Expected::Ok:           return speculo::ErrorKind::NotFound;
+        case Expected::NotFound:     return speculo::ErrorKind::NotFound;
+        case Expected::NotSupported: return speculo::ErrorKind::NotSupported;
+    }
+
+    return speculo::ErrorKind::NotFound;
+}
+
+[[nodiscard]] auto make_arguments(ArgumentForm form, int& int_value, double& double_value) -> speculo::Args
+{
+    switch (form)
+    {
+        case ArgumentForm::None:       return speculo::Args{};
+        case ArgumentForm::IntLvalue:  return speculo::Args{ int_value };
+        case ArgumentForm::IntLiteral: return speculo::Args{ 3 };
+        case ArgumentForm::Double:     return speculo::Args{ double_value };
+        case ArgumentForm::Pair:       return speculo::Args{ int_value, double_value };
+    }
+
+    std::abort();
+}
+
+} // namespace
+
+TEST(ConstructorNewInstanceMatrix, ConstructorSetByArgumentForm)
+{
+    const std::array<const speculo::Class*, 5> classes{
+        std::addressof(speculo::class_of<CtorEmpty>()),
+        std::addressof(speculo::class_of<CtorInt>()),
+        std::addressof(speculo::class_of<CtorPair>()),
+        std::addressof(speculo::class_of<CtorDeleted>()),
+        std::addressof(speculo::class_of<CtorPrivate>()),
+    };
+
+    int    int_value = 3;
+    double double_value = 4.0;
+
+    for (std::size_t row = 0; row < classes.size(); ++row)
+    {
+        for (std::size_t column = 0; column < kArgumentForms.size(); ++column)
+        {
+            const ArgumentForm form = kArgumentForms[column];
+            SCOPED_TRACE(std::format("{}/{}", classes[row]->get_name(), form_name(form)));
+
+            const Expected expected = kNewInstanceMatrix[row][column];
+            auto made = classes[row]->new_instance(make_arguments(form, int_value, double_value));
+
+            if (expected == Expected::Ok)
+            {
+                ASSERT_TRUE(made.is_ok());
+                EXPECT_EQ(std::move(made).unwrap().type(), *classes[row]);
+            }
+            else
+            {
+                ASSERT_TRUE(made.is_err());
+                EXPECT_EQ(made.unwrap_err().kind, expected_kind(expected));
+            }
+        }
+    }
+}

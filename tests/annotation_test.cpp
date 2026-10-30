@@ -82,3 +82,12 @@ TEST(AnnotationTest, BasesEnumeratorsAndNoInheritance)
     EXPECT_EQ(red.get_annotation<int>().unwrap(), 7);
     EXPECT_TRUE(color.get_enumerators()[1].get_annotations().empty());
 }
+
+TEST(AnnotationTest, EmptyHandlePanicsOnUse)
+{
+    const speculo::Annotation empty{};
+
+    EXPECT_TRUE(empty == speculo::Annotation{});
+    EXPECT_DEATH((void)empty.get_type(), "default-constructed");
+    EXPECT_DEATH((void)empty.is_readable(), "default-constructed");
+}

@@ -5,6 +5,7 @@ import crab_cpp;
 import speculo;
 
 #include "support/class_fixtures.h"
+#include "support/instance_fixtures.h"
 
 TEST(DeclaredViewTest, PrivateAndProtectedMembers)
 {
@@ -40,4 +41,27 @@ TEST(DeclaredViewTest, PrivateAndProtectedMembers)
     // The public method sees the new value too.
     speculo::Method read = cls.get_method("read_secret").unwrap();
     EXPECT_EQ(read.invoke(s, {}).unwrap().as<int>().unwrap(), 7);
+}
+
+TEST(DeclaredViewTest, TemplateLookupsReachPrivateMembers)
+{
+    const speculo::Class& cls = speculo::class_of<Secret>();
+
+    // Compile-time parameter list / compile-time name forms of the declared view.
+    EXPECT_TRUE(cls.get_declared_method<>("secret_method").is_ok());
+    EXPECT_TRUE((cls.get_declared_method<"secret_method">()).is_ok());
+
+    // A wrong parameter list or arity is NotFound, not a silently empty result.
+    EXPECT_EQ(cls.get_declared_method<int>("secret_method").unwrap_err().kind, speculo::ErrorKind::NotFound);
+    EXPECT_EQ((cls.get_declared_method<int, int>("secret_method")).unwrap_err().kind,
+              speculo::ErrorKind::NotFound);
+
+    // The public form stays blind to it.
+    EXPECT_EQ(cls.get_method<>("secret_method").unwrap_err().kind, speculo::ErrorKind::NotFound);
+
+    // Declared constructors: the template form sees the private one, the public
+    // form does not.
+    const speculo::Class& sealed = speculo::class_of<Sealed>();
+    EXPECT_TRUE(sealed.get_declared_constructor<int>().is_some());
+    EXPECT_TRUE(sealed.get_constructor<int>().is_none());
 }

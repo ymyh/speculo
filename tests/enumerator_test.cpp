@@ -123,3 +123,66 @@ TEST(EnumeratorTest, FromValueTakesAnyIntegerTypeByItsValue)
     EXPECT_TRUE(small.enum_from_value(-1).is_none());
     EXPECT_TRUE(small.enum_from_value(256).is_none());
 }
+
+TEST(EnumeratorTest, EmptyHandlePanicsOnUse)
+{
+    const speculo::Enumerator empty{};
+
+    EXPECT_TRUE(empty == speculo::Enumerator{});
+    EXPECT_DEATH((void)empty.get_name(), "default-constructed");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// conversion matrix: 4 enums × 6 conversions
+//
+// Each row is one enum with its own underlying type (int, unsigned, short,
+// unsigned char); the six cells assert that name/value lookup succeeds exactly
+// when the value exists and that enum_name_of rejects a value of another type.
+// ─────────────────────────────────────────────────────────────────────────────
+
+TEST(EnumConversionMatrix, EnumByConversion)
+{
+    struct Row
+    {
+        const speculo::Class* type = nullptr;
+        std::string_view      good_name;
+        std::string_view      missing_name;
+        std::int64_t          good_value = 0;
+        std::int64_t          bad_value = 0;
+    };
+
+    const std::array<Row, 4> rows{{
+        { std::addressof(speculo::class_of<Color>()),  "Green", "Purple", 5,   3 },
+        { std::addressof(speculo::class_of<Legacy>()), "Beta",  "Zeta",   2,   0 },
+        { std::addressof(speculo::class_of<Narrow>()), "Neg",   "Pos",   -3,   40000 },
+        { std::addressof(speculo::class_of<Small>()),  "High",  "Middle", 255, 256 },
+    }};
+
+    for (const Row& row : rows)
+    {
+        SCOPED_TRACE(std::string(row.type->get_name()));
+
+        // 1. name -> value, for an existing enumerator.
+        auto by_name = row.type->enum_from_name(row.good_name);
+        ASSERT_TRUE(by_name.is_some());
+
+        // 2. name -> value, for a name that is not an enumerator.
+        EXPECT_TRUE(row.type->enum_from_name(row.missing_name).is_none());
+
+        // 3. value -> value, matched by mathematical value across integer types.
+        EXPECT_TRUE(row.type->enum_from_value(row.good_value).is_some());
+
+        // 4. value -> value, for a value that is not an enumerator.
+        EXPECT_TRUE(row.type->enum_from_value(row.bad_value).is_none());
+
+        // 5. value -> name, round-tripping the object produced in cell 1.
+        const speculo::Object value = std::move(by_name).unwrap();
+        auto name = row.type->enum_name_of(value.cref());
+        ASSERT_TRUE(name.is_some());
+        EXPECT_EQ(name.unwrap(), row.good_name);
+
+        // 6. value -> name, for a value of another type.
+        int other = 0;
+        EXPECT_TRUE(row.type->enum_name_of(speculo::ObjectRef(other)).is_none());
+    }
+}
