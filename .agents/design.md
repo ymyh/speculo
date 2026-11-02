@@ -83,7 +83,7 @@ GCC 模块依赖规则（详见 @.agents/review.md「Phase 3」偏差 1）收敛
 | `speculo.compile` | 编译期半层：`field_count` / `member_count` / `for_each_field` / `for_each_member` / `field_info` / `field_table` |
 | ~~`speculo.ctor`~~ | `Constructor` 已并入 `speculo.object`（模块分区拆分限制，见 review.md Phase 3/4 偏差） |
 | ~~`speculo.array`~~ | `Array` 已并入 `speculo.object`（沿用「不拆模块分区」约束，见 review.md Phase 5 偏差 4-8） |
-| `speculo.registry` | 名字 → `Class`、签名 → `Function` 的全局注册表，`Class::for_name` / `Function::for_name` |
+| `speculo.registry` | 名字 → `Class`、签名 → `Function` 的全局注册表，`Class::for_name` / `Function::for_name`，以及关系图的反向边索引（base → derived）与关系查询（`get_derived_classes` / `is_derived_from` / `get_conversion_path` / 覆盖查询） |
 | `speculo`（主接口） | `export import` 以上所有分区 + 入口函数 `class_of<T>()` |
 
 内部实现（物化逻辑、thunk 生成）放 `speculo::detail`（见 `src/object.cppm` 与
@@ -223,6 +223,13 @@ speculo/
    成员函数里的 `= delete` 仍由类的成员表列出。内部链接（`static`、匿名命名空间）可以 `invoke`，
    但不进 `Function::for_name`。`consteval` 函数没有可用的 `<meta>` 谓词，点名可能直接编不过。
    成员函数仍走 `Method`。
+10. **private / protected 构造函数只能列，不能调**：`Class::get_declared_constructors()` 能看到它们，
+   但 `new_instance` / `construct_at` 必然返回 `NotSupported`——构造函数在命名空间作用域被 `new`
+   调用，那里没有类内访问权，`= delete` 与访问受限在反射里是同一种「不可调用」。要动态构造这类
+   类型，请提供一个 public 工厂函数并 `function_of` 点名它。
+11. **`Array::new_instance` 的元素不能是数组**：`Array::new_instance(class_of<int[3]>(), n)` 返回
+   `NotSupported`。动态数组的元素地址算术与「元素本身还有自己的 `new_array`」两套语义会互相纠缠，
+   而真实需求几乎总是「一维动态数组」。需要多维时用一维动态数组 + 手工索引，或把元素包一层结构体。
 
 ---
 
@@ -337,9 +344,12 @@ const/volatile/rvalue 三个 `bool`（尾部填充）。v2 把 **value category*
 - **零分配**靠 `InvokeIntoFn`（`self, args, dst`）：结果直接构造进调用方存储。
   `invoke` 退化为 `allocate + invoke_into + dtor`。
 - **分配器**是线程局部的默认指针 + 每次调用可指定的 `Allocator&`。
-  `Object` 头里**不存** Allocator 指针，只存释放 thunk —— 省 8 字节，且让 arena
-  的「整体释放」语义自然成立（deallocate 可以是空操作）。
-- 默认路径（不设分配器）保持 `::operator new`，零额外分支。
+  `Object` 是一个数据指针 + 类型描述符 + **per-object release thunk**（24 字节）；
+  它**不存** Allocator 指针：分配器路径在值前面放 `AllocationHeader`
+  （分配器、块指针、析构 thunk），释放时从值地址减回固定偏移取回。默认路径
+  （`m_release == nullptr`）仍走描述符的 `delete` thunk，零额外分支。
+- 默认路径（不设分配器）保持 `::operator new`；设置了默认分配器后所有 boxing
+  路径都走它，它拒绝分配时返回错误而**不**静默回退。
 
 ## 16. 身份：跨 DSO 与注册表 v2
 
@@ -354,9 +364,10 @@ const/volatile/rvalue 三个 `bool`（尾部填充）。v2 把 **value category*
 A 库物化出的 `Field` 用在 B 库构造的对象上，依赖两边布局与调用约定一致。
 
 注册表 v2 加**反向边索引**（base → derived），插入时维护。这让
-`get_derived_classes()` / `get_overrider_methods()` 成为 O(1) 取列表。同时必须在所有
-相关 API 上写明口径：**只覆盖已注册类型**。这是本库与 Java 最大的语义差异之一
-（Java 的 `Class` 全知），含糊过去会变成用户踩不完的坑。
+`get_derived_classes()` / `get_overrider_methods()` 成为 O(1) 取列表。索引键取基类的
+`normalized_name` 而不是描述符指针，与该节上面的第 2 条身份分支同口径；边只在某个类
+**首次**注册时建立。同时必须在所有相关 API 上写明口径：**只覆盖已注册类型**。这是本库与
+Java 最大的语义差异之一（Java 的 `Class` 全知），含糊过去会变成用户踩不完的坑。
 
 ## 17. 物化成本与闭包控制
 

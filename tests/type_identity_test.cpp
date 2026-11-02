@@ -60,3 +60,64 @@ TEST(TypeIdentityTest, ArrayRankAndExtent)
     EXPECT_EQ(speculo::class_of<int[]>().get_array_extent().unwrap(), 0u);
     EXPECT_TRUE(speculo::class_of<int>().get_element_type().is_none());
 }
+
+// ── Phase 12: integer type identity and std::hash (api_design §13) ──
+//
+//   API                         | 同类型 | 不同类型 | 空句柄 | 非规范名类型
+//   get_type_id()               | 相等   | 不等     | 0      | 由名字派生、进程内稳定
+//   operator==                  | true   | false    | true（两个空句柄） | 仅指针相等
+//   std::hash<Class>            | 与 id 一致 | ——   | 0      | 与 id 一致
+//
+// 第三个等价分支（两份 DSO 里的同名描述符）无法在单进程单 TU 里真实构造；
+// 见 testing.md §9「跨 DSO 身份」，这里只覆盖 id / hash 契约。
+
+TEST(TypeIdentityTest, TypeIdIsStablePerName)
+{
+    const speculo::Class& root = speculo::class_of<Root>();
+    EXPECT_EQ(root.get_type_id(), speculo::class_of<Root>().get_type_id());
+    EXPECT_NE(root.get_type_id(), speculo::class_of<Other>().get_type_id());
+    EXPECT_EQ(root.get_type_id(), speculo::class_of<Root>().get_type_id()); // repeat: cached
+
+    // cv / reference are distinct types, so their ids differ as well.
+    EXPECT_NE(speculo::class_of<int>().get_type_id(), speculo::class_of<const int>().get_type_id());
+    EXPECT_NE(speculo::class_of<int&>().get_type_id(), speculo::class_of<int>().get_type_id());
+}
+
+TEST(TypeIdentityTest, HashAgreesWithEquality)
+{
+    const std::hash<speculo::Class> hash;
+    EXPECT_EQ(hash(speculo::class_of<Root>()), hash(speculo::class_of<Root>()));
+    EXPECT_EQ(hash(speculo::class_of<Root>()), static_cast<std::size_t>(speculo::class_of<Root>().get_type_id()));
+
+    std::unordered_set<speculo::Class> types;
+    types.insert(speculo::class_of<Root>());
+    types.insert(speculo::class_of<Root>());
+    types.insert(speculo::class_of<Other>());
+    EXPECT_EQ(types.size(), 2u);
+
+    std::unordered_map<speculo::Class, int> by_type;
+    by_type[speculo::class_of<Root>()] = 1;
+    EXPECT_EQ(by_type.at(speculo::class_of<Root>()), 1);
+}
+
+TEST(TypeIdentityTest, NonCanonicalAndEmptyHandlesHaveIds)
+{
+    const speculo::Class empty;
+    EXPECT_EQ(empty.get_type_id(), 0u);
+    EXPECT_EQ(std::hash<speculo::Class>{}(empty), 0u);
+    EXPECT_EQ(empty, speculo::Class{});
+    EXPECT_FALSE(empty != speculo::Class{});
+
+    // Dynamic arrays have no canonical name: the id comes from the display name
+    // and stays stable for every object of that element type.
+    speculo::Object first = speculo::Array::new_instance(speculo::class_of<int>(), 2).unwrap();
+    speculo::Object second = speculo::Array::new_instance(speculo::class_of<int>(), 5).unwrap();
+    EXPECT_FALSE(first.type().has_canonical_name());
+    EXPECT_EQ(first.type().get_type_id(), second.type().get_type_id());
+    EXPECT_EQ(std::hash<speculo::Class>{}(first.type()), std::hash<speculo::Class>{}(second.type()));
+
+    // Different non-canonical types only compare by descriptor pointer.
+    speculo::Object doubles = speculo::Array::new_instance(speculo::class_of<double>(), 2).unwrap();
+    EXPECT_NE(first.type(), doubles.type());
+    EXPECT_NE(first.type().get_type_id(), doubles.type().get_type_id());
+}

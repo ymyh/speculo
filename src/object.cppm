@@ -162,6 +162,148 @@ private:
 };
 
 /**
+ * @brief Allocator used when an owning Object must be boxed (api_design §12)
+ *
+ * Object storage is released through the deallocation thunk left by the path
+ * that allocated it, so an Allocator only has to answer allocate/deallocate.
+ * `deallocate` may be a no-op (an arena frees everything at once).
+ */
+class Allocator
+{
+public:
+    virtual ~Allocator() = default;
+
+    /// Returns storage aligned for `alignment`; nullptr means failure.
+    [[nodiscard]] virtual auto allocate(std::size_t size, std::size_t alignment) -> void* = 0;
+
+    /// Releases one block previously returned by allocate().
+    virtual void deallocate(void* block) noexcept = 0;
+};
+
+/**
+ * @brief Bump allocator: allocate from chunks, release everything at once
+ *
+ * Suitable for one batch of reflective work (construct many Objects, then drop
+ * them together). Individual deallocate() calls are no-ops; reset() or the
+ * destructor releases the chunks.
+ */
+class ArenaAllocator final : public Allocator
+{
+public:
+    explicit ArenaAllocator(std::size_t chunk_size = 64 * 1024) noexcept
+        : m_chunk_size(chunk_size == 0 ? 64 * 1024 : chunk_size)
+    {
+    }
+
+    ArenaAllocator(const ArenaAllocator&) = delete;
+    auto operator=(const ArenaAllocator&) -> ArenaAllocator& = delete;
+
+    ~ArenaAllocator() override { reset(); }
+
+    [[nodiscard]] auto allocate(std::size_t size, std::size_t alignment) -> void* override
+    {
+        if (alignment == 0)
+        {
+            alignment = alignof(std::max_align_t);
+        }
+
+        if (m_current != nullptr)
+        {
+            void* aligned = align_forward(m_current, m_end, alignment);
+            if (aligned != nullptr && static_cast<std::byte*>(aligned) + size <= m_end)
+            {
+                m_current = static_cast<std::byte*>(aligned) + size;
+                return aligned;
+            }
+        }
+
+        const std::size_t needed = size + alignment;
+        const std::size_t chunk = needed > m_chunk_size ? needed : m_chunk_size;
+        Chunk* block = static_cast<Chunk*>(::operator new(sizeof(Chunk) + chunk, std::nothrow));
+        if (block == nullptr)
+        {
+            return nullptr;
+        }
+
+        block->next = m_chunks;
+        m_chunks = block;
+        m_current = reinterpret_cast<std::byte*>(block + 1);
+        m_end = m_current + chunk;
+
+        void* aligned = align_forward(m_current, m_end, alignment);
+        if (aligned == nullptr)
+        {
+            return nullptr;
+        }
+
+        m_current = static_cast<std::byte*>(aligned) + size;
+        return aligned;
+    }
+
+    void deallocate(void*) noexcept override
+    {
+        // Everything is released by reset() / the destructor.
+    }
+
+    /// Releases every chunk; the allocator is usable again afterwards.
+    void reset() noexcept
+    {
+        while (m_chunks != nullptr)
+        {
+            Chunk* next = m_chunks->next;
+            ::operator delete(static_cast<void*>(m_chunks));
+            m_chunks = next;
+        }
+
+        m_current = nullptr;
+        m_end = nullptr;
+    }
+
+    /// Number of live chunks (diagnostics / tests).
+    [[nodiscard]] auto get_chunk_count() const noexcept -> std::size_t
+    {
+        std::size_t count = 0;
+        for (const Chunk* chunk = m_chunks; chunk != nullptr; chunk = chunk->next)
+        {
+            ++count;
+        }
+
+        return count;
+    }
+
+private:
+    struct Chunk
+    {
+        Chunk* next = nullptr;
+    };
+
+    [[nodiscard]] static auto align_forward(std::byte* pointer, std::byte* end, std::size_t alignment) noexcept -> void*
+    {
+        const std::uintptr_t address = reinterpret_cast<std::uintptr_t>(pointer);
+        const std::uintptr_t aligned = (address + alignment - 1) & ~(static_cast<std::uintptr_t>(alignment) - 1);
+        if (reinterpret_cast<std::byte*>(aligned) + alignment > end)
+        {
+            return nullptr;
+        }
+
+        return reinterpret_cast<void*>(aligned);
+    }
+
+    std::size_t m_chunk_size;
+    Chunk*      m_chunks = nullptr;
+    std::byte*  m_current = nullptr;
+    std::byte*  m_end = nullptr;
+};
+
+namespace detail
+{
+
+/// Thread-local default allocator (api_design §12); nullptr means ::operator new.
+inline thread_local Allocator* default_allocator = nullptr;
+
+} // namespace speculo::detail
+
+/**
  * @brief Owning, type-erased object (move-only; use clone() for a deep copy)
  */
 class Object
@@ -169,12 +311,27 @@ class Object
 public:
     Object() noexcept = default;
 
+    /**
+     * @brief Thread-local allocator used by every Object this thread boxes
+     *        (api_design §12)
+     * @param allocator nullptr restores the default (`::operator new`)
+     * @note The pointer is not owned; it must outlive every Object allocated
+     *       through it. Classes / handle calls that take an explicit Allocator
+     *       (`Class::new_instance_with`) are unaffected.
+     */
+    static void set_default_allocator(Allocator* allocator) noexcept { detail::default_allocator = allocator; }
+
+    /// The thread-local allocator set by set_default_allocator(); nullptr by default.
+    [[nodiscard]] static auto get_default_allocator() noexcept -> Allocator* { return detail::default_allocator; }
+
     Object(Object&& other) noexcept
         : m_data(other.m_data)
         , m_desc(other.m_desc)
+        , m_release(other.m_release)
     {
         other.m_data = nullptr;
         other.m_desc = nullptr;
+        other.m_release = nullptr;
     }
 
     auto operator=(Object&& other) noexcept -> Object&
@@ -184,8 +341,10 @@ public:
             reset();
             m_data = other.m_data;
             m_desc = other.m_desc;
+            m_release = other.m_release;
             other.m_data = nullptr;
             other.m_desc = nullptr;
+            other.m_release = nullptr;
         }
 
         return *this;
@@ -336,21 +495,43 @@ private:
         return obj;
     }
 
+    /// Adopts storage whose release does not go through desc->release (an
+    /// Allocator-backed box, or a boxed_allocate block).
+    [[nodiscard]] static auto from_raw_with_release(void* data, const detail::TypeDescriptor* desc,
+                                                    detail::AllocatedReleaseFn release) noexcept -> Object
+    {
+        Object obj;
+        obj.m_data = data;
+        obj.m_desc = desc;
+        obj.m_release = release;
+
+        return obj;
+    }
+
     [[nodiscard]] auto descriptor() const noexcept -> const detail::TypeDescriptor* { return m_desc; }
 
     void reset() noexcept
     {
-        if (m_data != nullptr && m_desc != nullptr && m_desc->release != nullptr)
+        if (m_data != nullptr && m_desc != nullptr)
         {
-            m_desc->release(m_data);
+            if (m_release != nullptr)
+            {
+                m_release(m_data, m_desc);
+            }
+            else if (m_desc->release != nullptr)
+            {
+                m_desc->release(m_data);
+            }
         }
 
         m_data = nullptr;
         m_desc = nullptr;
+        m_release = nullptr;
     }
 
     void*                         m_data = nullptr;
     const detail::TypeDescriptor* m_desc = nullptr;
+    detail::AllocatedReleaseFn    m_release = nullptr;
 };
 
 /**
@@ -636,6 +817,136 @@ private:
     std::vector<const void*>                 m_heap;
     const void* const*                       m_data = nullptr;
 };
+
+/**
+ * @brief Diagnostic spelling of a type kind (Class::describe)
+ */
+[[nodiscard]] constexpr auto type_kind_name(TypeKind kind) noexcept -> std::string_view
+{
+    switch (kind)
+    {
+        case TypeKind::Void:          return "void";
+        case TypeKind::Fundamental:   return "fundamental";
+        case TypeKind::Pointer:       return "pointer";
+        case TypeKind::MemberPointer: return "member pointer";
+        case TypeKind::Array:         return "array";
+        case TypeKind::Enum:          return "enum";
+        case TypeKind::Union:         return "union";
+        case TypeKind::Class:         return "class";
+        case TypeKind::Function:      return "function";
+        case TypeKind::Reference:     return "reference";
+        case TypeKind::Template:      return "template";
+    }
+
+    return "unknown";
+}
+
+/**
+ * @brief Storage for one boxed value plus the release that matches it
+ * @note `release` is the path-specific release; it is never desc->release,
+ *       because the storage did not come from a plain `new T`.
+ */
+struct BoxedStorage
+{
+    void* data = nullptr;
+    AllocatedReleaseFn release = nullptr;
+};
+
+/// Per-allocation header placed in front of an Allocator-backed value.
+struct AllocationHeader
+{
+    Allocator* allocator = nullptr;
+    void*      block = nullptr;
+    DestroyFn  destroy = nullptr;
+};
+
+/// Offset from the block start to the value: the header, rounded up to the
+/// value's alignment. Always a compile-time constant for a given type, and
+/// recomputed from desc->alignment at run time by the release thunk.
+[[nodiscard]] constexpr auto allocation_offset(std::size_t alignment) noexcept -> std::size_t
+{
+    const std::size_t wanted = alignment > alignof(AllocationHeader) ? alignment : alignof(AllocationHeader);
+    return (sizeof(AllocationHeader) + wanted - 1) / wanted * wanted;
+}
+
+[[nodiscard]] inline auto allocation_header(void* data, const TypeDescriptor* desc) noexcept -> AllocationHeader*
+{
+    return reinterpret_cast<AllocationHeader*>(static_cast<std::byte*>(data) - allocation_offset(desc->alignment));
+}
+
+/// Release for Allocator-backed storage: destroy the value (when the allocation
+/// carried a constructor that ran), then hand the block back.
+inline auto allocation_release(void* data, const TypeDescriptor* desc) -> void
+{
+    AllocationHeader* header = allocation_header(data, desc);
+    if (header->destroy != nullptr)
+    {
+        header->destroy(data);
+    }
+
+    header->allocator->deallocate(header->block);
+}
+
+/**
+ * @brief Allocates a value-sized block through `allocator`
+ * @return data == nullptr when the allocator refused; otherwise the value's
+ *         address, aligned for desc->alignment, with the header before it
+ */
+[[nodiscard]] inline auto allocate_with(Allocator& allocator, const TypeDescriptor* desc) -> BoxedStorage
+{
+    const std::size_t offset = allocation_offset(desc->alignment);
+    const std::size_t alignment = desc->alignment > alignof(AllocationHeader) ? desc->alignment
+                                                                             : alignof(AllocationHeader);
+    void* block = allocator.allocate(offset + desc->size, alignment);
+    if (block == nullptr)
+    {
+        return {};
+    }
+
+    auto* header = static_cast<AllocationHeader*>(block);
+    header->allocator = std::addressof(allocator);
+    header->block = block;
+    header->destroy = desc->destroy;
+
+    return BoxedStorage{ static_cast<std::byte*>(block) + offset, &allocation_release };
+}
+
+/// Raw storage for one value of `desc`, honouring the thread-local default
+/// allocator and falling back to the descriptor's own allocation.
+[[nodiscard]] inline auto allocate_boxed_storage(const TypeDescriptor* desc) -> BoxedStorage
+{
+    if (Allocator* allocator = Object::get_default_allocator())
+    {
+        // No silent fallback: a set allocator owns every boxing allocation.
+        return allocate_with(*allocator, desc);
+    }
+
+    if (desc->boxed_allocate == nullptr)
+    {
+        return {};
+    }
+
+    return BoxedStorage{ desc->boxed_allocate(), desc->boxed_release };
+}
+
+/// Frees storage whose value was never constructed (construction failed).
+inline void discard_boxed_storage(BoxedStorage storage, const TypeDescriptor* desc) noexcept
+{
+    if (storage.data == nullptr)
+    {
+        return;
+    }
+
+    if (storage.release == &allocation_release)
+    {
+        AllocationHeader* header = allocation_header(storage.data, desc);
+        header->allocator->deallocate(header->block);
+        return;
+    }
+
+    const std::size_t alignment = desc->alignment == 0 ? 1 : desc->alignment;
+    ::operator delete(storage.data, std::align_val_t(alignment));
+}
 
 /**
  * @brief Whether `arg` (always an lvalue view) can bind to a parameter
@@ -1074,7 +1385,10 @@ public:
     /// Whether invoke() can run this method (false for `&&`-qualified members,
     /// destructors, deleted functions, C-variadic functions, and signatures the
     /// thunk cannot express).
-    [[nodiscard]] auto is_invokable() const -> bool { return m_desc->invoke != nullptr; }
+    [[nodiscard]] auto is_invokable() const -> bool
+    {
+        return m_desc->invoke != nullptr || m_desc->invoke_into != nullptr;
+    }
 
     /// Whether invoke_rvalue() can run this method: unqualified methods and
     /// `&&`-qualified ones (api_design §8.2).
@@ -1104,6 +1418,34 @@ public:
     /// Whether this is a C-style variadic member function (`...`). Only the fixed
     /// parameters are listed; invoke() / invoke_rvalue() are NotSupported.
     [[nodiscard]] auto is_variadic() const -> bool { return modifiers().is_variadic(); }
+
+    // ── Overriding (api_design §15) ──
+
+    /**
+     * @brief The base-class method this one overrides (Java {@code Method#getDeclaringClass} upward)
+     * @return The nearest virtual base method with the same name, the same
+     *         decayed parameter types and the same `const` qualification; None
+     *         when this method is not virtual, or when no base declares one
+     * @note The search goes through `get_declared_methods()` (any access level,
+     *       nearest base first), because a protected or private virtual method
+     *       can be overridden just as well as a public one. No RTTI is involved:
+     *       the match is a descriptor comparison done while the method is found.
+     * @note Covariant return types are *not* matched (that needs an upcast of
+     *       the returned type; see api_design §15.2 and §17).
+     */
+    [[nodiscard]] auto get_overridden_method() const -> Option<Method>;
+
+    /**
+     * @brief Every registered method that overrides this one
+     * @return One Method per registered class that derives from the declaring
+     *         class (through any path) and declares an override, in registration
+     *         order
+     * @note **Only registered types are seen**: a class enters the table when
+     *       `class_of<T>()` has been called for it (or `SPECULO_REGISTER` ran).
+     *       A derived type that was never materialized is invisible here, which
+     *       is the one place where speculo is not all-knowing (api_design §15.2).
+     */
+    [[nodiscard]] auto get_overrider_methods() const -> std::vector<Method>;
 
     [[nodiscard]] auto get_ref_qualifier() const -> RefQualifier { return m_desc->ref_qualifier; }
     [[nodiscard]] auto get_signature() const -> std::string_view { return m_desc->signature; }
@@ -1181,11 +1523,32 @@ public:
             return checked.unwrap_err();
         }
 
-        if (m_desc->invoke == nullptr)
+        // A reference result is boxed by copying the referent; only the old
+        // boxing thunk can do that (invoke_into refuses references).
+        if (returns_reference())
         {
-            const char* reason = is_deleted() ? "the function is deleted"
-                                 : is_ref_invokable() ? "the referenced result is not copyable (use invoke_ref())"
-                                                      : "the method is not available";
+            if (m_desc->invoke == nullptr)
+            {
+                const char* reason = is_deleted() ? "the function is deleted"
+                                     : is_ref_invokable() ? "the referenced result is not copyable (use invoke_ref())"
+                                                          : "the method is not available";
+                return Error{ErrorKind::NotSupported, std::format("{}: {}", context("Method::invoke"), reason)};
+            }
+
+            const detail::ArgumentPointers pointers = argument_pointers(args);
+            void* receiver = is_static_member() ? nullptr : const_cast<void*>(obj.raw_data());
+            void* result = m_desc->invoke(receiver, pointers.data());
+            if (result == nullptr)
+            {
+                return Object{};
+            }
+
+            return Object::from_raw(result, m_desc->return_type->decayed);
+        }
+
+        if (m_desc->invoke_into == nullptr)
+        {
+            const char* reason = is_deleted() ? "the function is deleted" : "the method is not available";
             return Error{ErrorKind::NotSupported, std::format("{}: {}", context("Method::invoke"), reason)};
         }
 
@@ -1193,13 +1556,117 @@ public:
 
         // A non-const method on a const receiver was rejected above.
         void* receiver = is_static_member() ? nullptr : const_cast<void*>(obj.raw_data());
-        void* result = m_desc->invoke(receiver, pointers.data());
-        if (result == nullptr)
+        if (m_desc->return_type->kind == TypeKind::Void)
         {
+            m_desc->invoke_into(nullptr, receiver, pointers.data());
             return Object{};
         }
 
-        return Object::from_raw(result, m_desc->return_type->decayed);
+        const detail::BoxedStorage storage = detail::allocate_boxed_storage(m_desc->return_type->decayed);
+        if (storage.data == nullptr)
+        {
+            return Error{ErrorKind::NotSupported,
+                         std::format("{}: no storage for the result (the allocator refused)", context("Method::invoke"))};
+        }
+
+        m_desc->invoke_into(storage.data, receiver, pointers.data());
+        return Object::from_raw_with_release(storage.data, m_desc->return_type->decayed, storage.release);
+    }
+
+    /**
+     * @brief Invokes the method, constructing the result into `dst` (api_design §11)
+     * @param dst Storage for the result, aligned and large enough for the
+     *            declared return type (the remove_cvref of it). Ignored for a
+     *            void method.
+     * @return NotSupported for a reference-returning method (use invoke_ref()),
+     *         a `&&`-qualified method (use invoke_rvalue()), a deleted or
+     *         variadic method; the argument / receiver errors of invoke()
+     * @note `dst` being null or misaligned is a precondition failure (`panic`);
+     *       storage size cannot be checked at run time, so a too-small buffer
+     *       is undefined behaviour.
+     * @note This path performs no allocation: the result is placement-newed
+     *       directly into `dst`.
+     */
+    [[nodiscard]] auto invoke_into(void* dst, ObjectRef obj, Args args = {}) const -> Status
+    {
+        const Status checked = check_call("Method::invoke_into", obj, args);
+        if (checked.is_err())
+        {
+            return checked.unwrap_err();
+        }
+
+        if (returns_reference())
+        {
+            return Error{ErrorKind::NotSupported,
+                         std::format("{}: the method returns a reference; invoke_into() does not copy it (use invoke_ref())",
+                                     context("Method::invoke_into"))};
+        }
+
+        if (m_desc->invoke_into == nullptr)
+        {
+            const char* reason = is_deleted() ? "the function is deleted"
+                                 : get_ref_qualifier() == RefQualifier::Rvalue
+                                     ? "the method is rvalue-qualified (&&); use invoke_rvalue()"
+                                 : is_variadic() ? "a C variadic function cannot be called through this handle"
+                                                 : "the method is not available";
+            return Error{ErrorKind::NotSupported,
+                         std::format("{}: {}", context("Method::invoke_into"), reason)};
+        }
+
+        const bool is_void = m_desc->return_type == nullptr || m_desc->return_type->kind == TypeKind::Void;
+        if (!is_void)
+        {
+            if (dst == nullptr)
+            {
+                crab_cpp::panic("speculo: Method::invoke_into() requires non-null storage");
+            }
+
+            const std::size_t alignment = m_desc->return_type->decayed->alignment;
+            if (alignment != 0 && reinterpret_cast<std::uintptr_t>(dst) % alignment != 0)
+            {
+                crab_cpp::panic("speculo: Method::invoke_into() destination is not aligned for the return type");
+            }
+        }
+
+        const detail::ArgumentPointers pointers = argument_pointers(args);
+        void* receiver = is_static_member() ? nullptr : const_cast<void*>(obj.raw_data());
+        m_desc->invoke_into(is_void ? nullptr : dst, receiver, pointers.data());
+
+        return None{};
+    }
+
+    /**
+     * @brief Invokes the method into an existing owning Object (api_design §11)
+     * @param dst A non-empty Object holding the method's return type (the
+     *            remove_cvref of it); it is overwritten in place, not replaced
+     * @return InvalidArgument when the method returns void or `dst` is empty;
+     *         TypeMismatch when `dst` holds another type; otherwise invoke_into's
+     *         errors
+     */
+    [[nodiscard]] auto invoke_into(Object& dst, ObjectRef obj, Args args = {}) const -> Status
+    {
+        const bool is_void = m_desc->return_type == nullptr || m_desc->return_type->kind == TypeKind::Void;
+        if (is_void)
+        {
+            return Error{ErrorKind::InvalidArgument,
+                         std::format("{}: the method returns void, so it has no destination value",
+                                     context("Method::invoke_into"))};
+        }
+
+        if (dst.is_null())
+        {
+            return Error{ErrorKind::InvalidArgument,
+                         std::format("{}: the destination Object is empty", context("Method::invoke_into"))};
+        }
+
+        if (dst.descriptor() != m_desc->return_type->decayed)
+        {
+            return Error{ErrorKind::TypeMismatch,
+                         std::format("{}: the destination holds '{}', not '{}'", context("Method::invoke_into"),
+                                     dst.descriptor()->qualified_name, m_desc->return_type->decayed->qualified_name)};
+        }
+
+        return invoke_into(dst.raw_data(), obj, std::move(args));
     }
 
     /**
@@ -1579,8 +2046,22 @@ public:
                          std::format("{}: this constructor cannot be invoked", context("Constructor::new_instance"))};
         }
 
-        const detail::ArgumentPointers pointers = argument_pointers(args);
-        return Object::from_raw(m_desc->new_instance(pointers.data()), m_desc->declaring_class);
+        const detail::BoxedStorage storage = detail::allocate_boxed_storage(m_desc->declaring_class);
+        if (storage.data == nullptr)
+        {
+            return Error{ErrorKind::NotSupported,
+                         std::format("{}: no storage is available (the allocator refused or the type cannot be boxed)",
+                                     context("Constructor::new_instance"))};
+        }
+
+        const Status constructed = construct_at(storage.data, std::move(args));
+        if (constructed.is_err())
+        {
+            detail::discard_boxed_storage(storage, m_desc->declaring_class);
+            return constructed.unwrap_err();
+        }
+
+        return Object::from_raw_with_release(storage.data, m_desc->declaring_class, storage.release);
     }
 
     /**
@@ -1945,6 +2426,22 @@ public:
     [[nodiscard]] auto has_canonical_name() const -> bool { return m_desc->has_canonical_name; }
 
     /**
+     * @brief Process-wide integer identity of the type (api_design §13)
+     * @return An id assigned by the registry from the canonical name (FNV-1a,
+     *         collision chain); equal for the same type in any copy of the
+     *         library that sees the same name
+     * @note Prefer this over `operator==` when the type is used as a key on a
+     *       hot path: `operator==` can degrade to a string comparison, while
+     *       the id is one integer comparison.
+     * @note Types without a canonical name (anonymous-namespace / function-local
+     *       / dynamic-array views) get an id derived from their display name;
+     *       it is stable within the process but two distinct anonymous copies
+     *       may share it. Such handles also never compare equal by name.
+     * @note Defined in the `speculo:registry` partition (Phase 12).
+     */
+    [[nodiscard]] auto get_type_id() const -> std::uint64_t;
+
+    /**
      * @brief Looks up a type by name (Java {@code Class.forName})
      * @param qualified_name Either name of the type: get_qualified_name() or
      *        get_normalized_name(). Any spelling that normalizes to the same
@@ -1993,6 +2490,55 @@ public:
     [[nodiscard]] auto get_size() const -> std::size_t { return m_desc->size; }
     [[nodiscard]] auto get_alignment() const -> std::size_t { return m_desc->alignment; }
     [[nodiscard]] auto modifiers() const -> Modifier { return Modifier(m_desc->modifiers); }
+
+    /**
+     * @brief Multi-line description for diagnostics (api_design §16)
+     *
+     * Stable format: the qualified name, kind, size/alignment, modifiers, then
+     * one line per public field and per public method. Meant for logs and
+     * snapshot tests; do not parse it.
+     */
+    [[nodiscard]] auto describe() const -> std::string
+    {
+        std::string text(m_desc->qualified_name);
+        text += std::format("\n  kind: {}", detail::type_kind_name(m_desc->kind));
+        if (m_desc->normalized_name != m_desc->qualified_name)
+        {
+            text += std::format("\n  normalized: {}", m_desc->normalized_name);
+        }
+
+        text += std::format("\n  size: {} byte(s), alignment: {}", m_desc->size, m_desc->alignment);
+        text += std::format("\n  modifiers: {}", modifiers().to_string());
+
+        text += "\n  fields:";
+        if (get_fields().empty())
+        {
+            text += " (none)";
+        }
+        else
+        {
+            for (const Field& field : get_fields())
+            {
+                text += std::format("\n    {} {} @ {}", field.get_type().get_normalized_name(), field.get_name(),
+                                    field.get_offset());
+            }
+        }
+
+        text += "\n  methods:";
+        if (get_methods().empty())
+        {
+            text += " (none)";
+        }
+        else
+        {
+            for (const Method& method : get_methods())
+            {
+                text += std::format("\n    {}", method.get_signature());
+            }
+        }
+
+        return text;
+    }
 
     // ── C++-specific composition / qualification (Phase 5) ──
 
@@ -2517,56 +3063,34 @@ public:
      */
     [[nodiscard]] auto new_instance(Args args = {}) const -> Outcome<Object>
     {
-        if (is_abstract())
+        const Outcome<Constructor> chosen = resolve_constructor("Class::new_instance", args);
+        if (chosen.is_err())
         {
-            return Error{ErrorKind::NotSupported,
-                         std::format("Class::new_instance({}): cannot instantiate an abstract class",
-                                     get_qualified_name())};
+            return chosen.unwrap_err();
         }
 
-        const Constructor* chosen = nullptr;
-        bool deleted_match = false;
-        for (const Constructor& ctor : get_constructors())
+        return chosen.unwrap().new_instance(std::move(args));
+    }
+
+    /**
+     * @brief Constructs an owning instance through an explicit allocator
+     * @param allocator Storage provider for the new object (api_design §12)
+     * @param args Same matching rules as new_instance()
+     * @return The constructor-selection errors of new_instance(); NotSupported
+     *         when the allocator refuses or the type cannot be destroyed
+     * @note The allocation is released through `allocator` when the Object dies,
+     *       so the allocator must outlive it. Unlike the default path this does
+     *       not consult Object::get_default_allocator().
+     */
+    [[nodiscard]] auto new_instance_with(Allocator& allocator, Args args = {}) const -> Outcome<Object>
+    {
+        const Outcome<Constructor> chosen = resolve_constructor("Class::new_instance_with", args);
+        if (chosen.is_err())
         {
-            if (!ctor.accepts(args))
-            {
-                continue;
-            }
-
-            if (ctor.is_deleted())
-            {
-                deleted_match = true; // does not shadow a usable candidate
-                continue;
-            }
-
-            if (chosen != nullptr)
-            {
-                return Error{ErrorKind::Ambiguous,
-                             std::format("Class::new_instance({}): several constructors accept the arguments {}: "
-                                         "'{}' and '{}'; call one of them directly",
-                                         get_qualified_name(), detail::describe_arguments(args),
-                                         chosen->get_signature(), ctor.get_signature())};
-            }
-
-            chosen = &ctor;
+            return chosen.unwrap_err();
         }
 
-        if (chosen != nullptr)
-        {
-            return chosen->new_instance(std::move(args));
-        }
-
-        if (deleted_match)
-        {
-            return Error{ErrorKind::NotSupported,
-                         std::format("Class::new_instance({}): the constructor matching the arguments {} is deleted",
-                                     get_qualified_name(), detail::describe_arguments(args))};
-        }
-
-        return Error{ErrorKind::NotFound,
-                     std::format("Class::new_instance({}): no public constructor accepts the arguments {} "
-                                 "(argument types must match the parameters exactly)",
-                                 get_qualified_name(), detail::describe_arguments(args))};
+        return construct_with(allocator, chosen.unwrap(), std::move(args));
     }
 
     /**
@@ -2888,6 +3412,63 @@ public:
         return ObjectRef(found, base.descriptor(), obj.is_const(), obj.is_volatile(), obj.value_category());
     }
 
+    // ── Relation graph: inheritance edges (api_design §15) ──
+
+    /**
+     * @brief Whether this class derives from `base`, following public paths only
+     * @note Transitive and the mirror image of is_assignable_from():
+     *       `derived.is_derived_from(base) == base.is_assignable_from(derived)`.
+     *       A class is *not* derived from itself here (use `==` for identity);
+     *       get_conversion_path() is the one that counts identity as a path.
+     */
+    [[nodiscard]] auto is_derived_from(const Class& base) const -> bool
+    {
+        // Both handles must be real: reading a graph relation through an empty
+        // handle is a programmer error, exactly like every other read through one
+        // (the CheckedDesc inside get_qualified_name() reports it).
+        (void)get_qualified_name();
+        (void)base.get_qualified_name();
+
+        return *this != base && base.is_assignable_from(*this);
+    }
+
+    /**
+     * @brief The direct derived classes that are registered
+     * @return One entry per registered class that lists this class as a direct
+     *         base, in registration order (registration order, not declaration
+     *         order, so the result is stable but arbitrary)
+     * @note **Only registered types are seen**: a class is registered by
+     *       class_of<T>() on first use, or by SPECULO_REGISTER. Speculo cannot
+     *       enumerate types it has never materialized, so a derived class that
+     *       nobody asked about is simply not listed (api_design §15.2).
+     * @note Defined in the `speculo:registry` partition, where the reverse
+     *       (base -> derived) index lives.
+     */
+    [[nodiscard]] auto get_derived_classes() const -> std::vector<const Class*>;
+
+    /// Every registered descendant (transitive closure of get_derived_classes(),
+    /// nearest level first). Same registration caveat as get_derived_classes().
+    /// Defined in the `speculo:registry` partition.
+    [[nodiscard]] auto get_all_derived_classes() const -> std::vector<const Class*>;
+
+    /**
+     * @brief The upward inheritance path from this class to `base`
+     * @param base The target base class; `*this` itself is allowed
+     * @return The path, starting at this class and ending at `base`
+     *         (`{*this}` for the identity case), each entry a canonical Class
+     *         handle; every hop is a public base edge
+     * @return TypeMismatch when `base` is not a base of this class at all;
+     *         NotSupported when it is one only through protected / private
+     *         inheritance (the same split as cast_to()); Ambiguous when several
+     *         distinct `base` subobjects are reachable
+     * @note Two paths that enter the same *virtual* base subobject are one path
+     *       (a virtual base is shared), so a virtual diamond resolves instead of
+     *       being ambiguous -- exactly the rule cast_to() applies to addresses.
+     * @note Defined in the `speculo:registry` partition.
+     */
+    [[nodiscard]] auto get_conversion_path(const Class& base) const
+        -> Outcome<std::vector<const Class*>>;
+
     // ── Type-system structure: templates, function types, aggregates, nesting ──
     // (v2, @.agents/api_design.md §1–§4)
 
@@ -2997,6 +3578,27 @@ public:
     }
 
     /**
+     * @brief Aggregate-initializes an instance through an explicit allocator
+     * @param allocator Storage provider for the new object (api_design §12)
+     * @param args One argument per initializer slot, as new_aggregate()
+     * @return NotSupported when the type is not an aggregate / a slot cannot be
+     *         initialized, or the allocator refuses; InvalidArgument / TypeMismatch
+     *         as new_aggregate()
+     */
+    [[nodiscard]] auto new_aggregate_with(Allocator& allocator, Args args = {}) const -> Outcome<Object>
+    {
+        if (!is_aggregate() || m_desc->aggregate_initializer == nullptr)
+        {
+            return Error{ErrorKind::NotSupported,
+                         std::format("Class::new_aggregate_with({}): the type is not an aggregate, or a base / member "
+                                     "cannot be initialized from a value",
+                                     get_qualified_name())};
+        }
+
+        return construct_with(allocator, aggregate_initializer(), std::move(args));
+    }
+
+    /**
      * @brief A pseudo constructor describing the aggregate initialization slots
      * @return Some(constructor) whose parameter list is the initializer list
      *         (public bases first, then non-static data members); None when the
@@ -3085,10 +3687,119 @@ public:
         return m_desc->size == other.m_desc->size && is_trivially_copyable() && other.is_trivially_copyable();
     }
 
-    [[nodiscard]] auto operator==(const Class& other) const noexcept -> bool { return m_desc == other.m_desc; }
-    [[nodiscard]] auto operator!=(const Class& other) const noexcept -> bool { return m_desc != other.m_desc; }
+    /**
+     * @brief Type identity (api_design §13)
+     * @return true when this is the same type as `other`
+     * @note Three branches: the descriptor pointers are equal (the usual case,
+     *       one pointer comparison); both types have a canonical name and their
+     *       normalized names are equal (the same type materialized in two DLLs /
+     *       two static copies of the library); otherwise false.
+     * @warning `std::hash<Class>` follows the same equivalence (it returns
+     *          get_type_id()), so `Class` can key an unordered container.
+     */
+    [[nodiscard]] auto operator==(const Class& other) const noexcept -> bool
+    {
+        const detail::TypeDescriptor* const mine = m_desc.get();
+        const detail::TypeDescriptor* const theirs = other.m_desc.get();
+        if (mine == theirs)
+        {
+            return true; // also covers two empty (default-constructed) handles
+        }
+
+        if (mine == nullptr || theirs == nullptr)
+        {
+            return false;
+        }
+
+        if (mine->has_canonical_name && theirs->has_canonical_name)
+        {
+            return mine->normalized_name == theirs->normalized_name;
+        }
+
+        return false;
+    }
+
+    [[nodiscard]] auto operator!=(const Class& other) const noexcept -> bool { return !(*this == other); }
 
 private:
+    /// Shared constructor selection for new_instance / new_instance_with.
+    [[nodiscard]] auto resolve_constructor(std::string_view operation, const Args& args) const
+        -> Outcome<Constructor>
+    {
+        if (is_abstract())
+        {
+            return Error{ErrorKind::NotSupported,
+                         std::format("{}({}): cannot instantiate an abstract class", operation,
+                                     get_qualified_name())};
+        }
+
+        const Constructor* chosen = nullptr;
+        bool deleted_match = false;
+        for (const Constructor& ctor : get_constructors())
+        {
+            if (!ctor.accepts(args))
+            {
+                continue;
+            }
+
+            if (ctor.is_deleted())
+            {
+                deleted_match = true; // does not shadow a usable candidate
+                continue;
+            }
+
+            if (chosen != nullptr)
+            {
+                return Error{ErrorKind::Ambiguous,
+                             std::format("{}({}): several constructors accept the arguments {}: "
+                                         "'{}' and '{}'; call one of them directly",
+                                         operation, get_qualified_name(), detail::describe_arguments(args),
+                                         chosen->get_signature(), ctor.get_signature())};
+            }
+
+            chosen = &ctor;
+        }
+
+        if (chosen != nullptr)
+        {
+            return *chosen;
+        }
+
+        if (deleted_match)
+        {
+            return Error{ErrorKind::NotSupported,
+                         std::format("{}({}): the constructor matching the arguments {} is deleted", operation,
+                                     get_qualified_name(), detail::describe_arguments(args))};
+        }
+
+        return Error{ErrorKind::NotFound,
+                     std::format("{}({}): no public constructor accepts the arguments {} "
+                                 "(argument types must match the parameters exactly)",
+                                 operation, get_qualified_name(), detail::describe_arguments(args))};
+    }
+
+    /// Allocates through `allocator`, runs `ctor` in place, and adopts the block.
+    [[nodiscard]] auto construct_with(Allocator& allocator, const Constructor& ctor, Args args) const
+        -> Outcome<Object>
+    {
+        const detail::BoxedStorage storage = detail::allocate_with(allocator, m_desc.get());
+        if (storage.data == nullptr)
+        {
+            return Error{ErrorKind::NotSupported,
+                         std::format("Class::new_instance_with({}): the allocator returned no storage",
+                                     get_qualified_name())};
+        }
+
+        const Status constructed = ctor.construct_at(storage.data, std::move(args));
+        if (constructed.is_err())
+        {
+            detail::discard_boxed_storage(storage, m_desc.get());
+            return constructed.unwrap_err();
+        }
+
+        return Object::from_raw_with_release(storage.data, m_desc.get(), storage.release);
+    }
+
     [[nodiscard]] static auto as_span(std::initializer_list<const Class*> values) noexcept -> std::span<const Class* const>
     {
         return std::span<const Class* const>(values.begin(), values.size());
@@ -4015,6 +4726,22 @@ inline auto ObjectRef::clone() const -> Result<Object, Error>
 
 } // namespace speculo
 
+/**
+ * @brief `std::hash` for Class follows the relaxed equality of api_design §13
+ *
+ * `Class::operator==` is true for two descriptors with the same canonical name,
+ * so the hash has to agree; using the descriptor address would put equal handles
+ * into different buckets and silently break unordered containers.
+ */
+template<>
+struct std::hash<speculo::Class>
+{
+    [[nodiscard]] auto operator()(const speculo::Class& cls) const noexcept -> std::size_t
+    {
+        return static_cast<std::size_t>(cls.get_type_id());
+    }
+};
+
 namespace speculo::detail
 {
 
@@ -4025,6 +4752,7 @@ struct Access
 {
     [[nodiscard]] static auto descriptor(const Class& cls) noexcept -> const TypeDescriptor* { return cls.descriptor(); }
     [[nodiscard]] static auto descriptor(const ObjectRef& ref) noexcept -> const TypeDescriptor* { return ref.descriptor(); }
+    [[nodiscard]] static auto descriptor(const Object& obj) noexcept -> const TypeDescriptor* { return obj.descriptor(); }
 
     template<typename Handle, typename Desc>
     [[nodiscard]] static constexpr auto make(const Desc* desc) noexcept -> Handle { return Handle(desc); }
@@ -4033,6 +4761,13 @@ struct Access
     [[nodiscard]] static auto adopt_object(void* data, const TypeDescriptor* desc) noexcept -> Object
     {
         return Object::from_raw(data, desc);
+    }
+
+    /// Adopts storage whose release does not go through desc->release.
+    [[nodiscard]] static auto adopt_object(void* data, const TypeDescriptor* desc,
+                                           AllocatedReleaseFn release) noexcept -> Object
+    {
+        return Object::from_raw_with_release(data, desc, release);
     }
 
     [[nodiscard]] static auto view_object(const void* data, const TypeDescriptor* desc, bool is_const,
@@ -4049,6 +4784,12 @@ struct Access
     [[nodiscard]] static auto is_default_argument(const Annotation& annotation) noexcept -> bool
     {
         return annotation.m_desc.get() != nullptr && annotation.m_desc->is_default_argument;
+    }
+
+    /// The std::format thunk of a field, nullptr when the type is not formattable.
+    [[nodiscard]] static auto field_format(const Field& field) noexcept -> FieldFormatFn
+    {
+        return field.m_desc->format;
     }
 
     /// The const view of a readable default_argument<T>'s inner value.
@@ -4267,6 +5008,57 @@ consteval auto is_unqualified_object(meta::info C) -> bool
         && !meta::is_array_type(C);
 }
 
+// ── Compile-time guard rails (design §17) ──
+//
+// A genuinely huge type (hundreds of members) turns materialization into an
+// all-night compile with no useful diagnostic. The limits are deliberately
+// generous; exceeding them means the type should be split, or that the user
+// opted std types in by mistake.
+
+inline constexpr std::size_t kMemberLimit = 512;
+inline constexpr std::size_t kTemplateArgumentLimit = 32;
+
+/**
+ * @brief Builds the static_assert message for a limit violation
+ *
+ * GCC 16.2 supports consteval string_view messages (P2741), so the message
+ * names the offending type instead of pointing at a generic assert.
+ */
+template<meta::info C>
+consteval auto guard_message(std::string_view what, std::size_t count, std::size_t limit,
+                             std::string_view advice) -> std::string_view
+{
+    std::array<char, 512> buffer{};
+    std::size_t length = 0;
+    const auto append = [&](std::string_view text)
+    {
+        for (const char c : text)
+        {
+            if (length < buffer.size())
+            {
+                buffer[length++] = c;
+            }
+        }
+    };
+
+    append("speculo: '");
+    append(meta::display_string_of(C));
+    append("' has ");
+    append(what);
+    append(" (");
+    char digits[32]{};
+    const auto converted = std::to_chars(digits, digits + sizeof(digits), count);
+    append(std::string_view(digits, static_cast<std::size_t>(converted.ptr - digits)));
+    append(", limit ");
+    const auto converted_limit = std::to_chars(digits, digits + sizeof(digits), limit);
+    append(std::string_view(digits, static_cast<std::size_t>(converted_limit.ptr - digits)));
+    append("); ");
+    append(advice);
+
+    const auto frozen = std::define_static_array(std::span<const char>(buffer.data(), length));
+    return std::string_view(frozen.data(), frozen.size());
+}
+
 /**
  * @brief Whether C has a canonical, globally addressable qualified name
  *
@@ -4385,7 +5177,7 @@ consteval auto declared_max_parameters() -> std::size_t
 template<meta::info C>
 consteval auto base_count() -> std::size_t
 {
-    if constexpr (is_unqualified_class(C) && !is_std_type(C))
+    if constexpr (expandable_type<C>())
     {
         return meta::bases_of(C, unchecked_context()).size();
     }
@@ -4795,7 +5587,7 @@ consteval auto is_nested_type_member(meta::info member) -> bool
 template<meta::info C>
 consteval auto nested_type_count() -> std::size_t
 {
-    if constexpr (is_unqualified_class(C) && !is_std_type(C))
+    if constexpr (expandable_type<C>())
     {
         std::size_t count = 0;
         for (meta::info member : meta::members_of(C, unchecked_context()))
@@ -5347,6 +6139,34 @@ consteval auto own_annotations() -> const AnnotationSet<DirectAnnotations<Entity
 }
 
 template<meta::info M>
+consteval auto make_field_format() -> FieldFormatFn
+{
+    using FieldType = typename[: meta::type_of(M) :];
+    using F = std::remove_cvref_t<FieldType>;
+
+    if constexpr (!std::is_array_v<F> && !std::is_volatile_v<std::remove_reference_t<FieldType>>
+               && std::formattable<F, char>)
+    {
+        if constexpr (meta::is_static_member(M))
+        {
+            return +[](const void*) -> std::string { return std::format("{}", [:M:]); };
+        }
+        else
+        {
+            using C = typename[: meta::parent_of(M) :];
+            return +[](const void* self) -> std::string
+            {
+                return std::format("{}", static_cast<const C*>(self)->[:M:]);
+            };
+        }
+    }
+    else
+    {
+        return nullptr;
+    }
+}
+
+template<meta::info M>
 consteval auto make_field_desc(const TypeDescriptor* type, const TypeDescriptor* declaring) -> FieldDesc
 {
     using FieldType = typename[: meta::type_of(M) :];
@@ -5400,6 +6220,7 @@ consteval auto make_field_desc(const TypeDescriptor* type, const TypeDescriptor*
     desc.get = make_field_get<M>();
     desc.set = make_field_set<M>();
     desc.get_ref = make_field_ref<M>();
+    desc.format = make_field_format<M>();
     desc.annotations = own_annotations<M>().handles.data();
     desc.annotation_count = own_annotations<M>().count;
 
@@ -5691,6 +6512,66 @@ consteval auto make_ref_invoker(std::index_sequence<I...>) -> InvokeRefFn
         };
     }
 }
+// ── Zero-allocation invocation (api_design §11) ─────────────────────────────
+//
+// InvokeIntoFn constructs the result directly into caller-provided storage.
+// `dst` is ignored for void results (the caller passes nullptr). Reference
+// returns are not handled here (invoke_ref() exposes the referent instead).
+
+template<meta::info M>
+consteval auto make_conversion_into_invoker() -> InvokeIntoFn
+{
+    using C = typename[: meta::parent_of(M) :];
+    using R = typename[: meta::return_type_of(M) :];
+
+    return +[](void* dst, void* self, const void* const*) -> void
+    {
+        auto* receiver = static_cast<C*>(self);
+        ::new (dst) std::remove_cvref_t<R>(static_cast<R>(*receiver));
+    };
+}
+
+template<meta::info M, std::size_t... I>
+consteval auto make_into_invoker(std::index_sequence<I...>) -> InvokeIntoFn
+{
+    using F = typename[: meta::type_of(M) :];
+    using R = typename[: meta::return_type_of(M) :];
+
+    if constexpr (meta::is_static_member(M))
+    {
+        using FP = typename static_function_pointer<F>::type;
+        return +[](void* dst, void*, const void* const* args) -> void
+        {
+            constexpr FP function = meta::extract<FP>(M);
+            if constexpr (std::is_void_v<R>)
+            {
+                function(load_argument<M, I>(args)...);
+            }
+            else
+            {
+                ::new (dst) std::remove_cvref_t<R>(function(load_argument<M, I>(args)...));
+            }
+        };
+    }
+    else
+    {
+        using C = typename[: meta::parent_of(M) :];
+        using MP = typename member_function_pointer<C, F>::type;
+        return +[](void* dst, void* self, const void* const* args) -> void
+        {
+            constexpr MP function = meta::extract<MP>(M);
+            auto* receiver = static_cast<C*>(self);
+            if constexpr (std::is_void_v<R>)
+            {
+                (receiver->*function)(load_argument<M, I>(args)...);
+            }
+            else
+            {
+                ::new (dst) std::remove_cvref_t<R>((receiver->*function)(load_argument<M, I>(args)...));
+            }
+        };
+    }
+}
 
 
 template<meta::info M>
@@ -5786,8 +6667,10 @@ consteval auto make_method_desc(const TypeDescriptor* declaring, const TypeDescr
             else
             {
                 // A reference return of a move-only type cannot be boxed by copy,
-                // but invoke_ref() can still hand out the referent.
-                if constexpr (boxable)
+                // but invoke_ref() can still hand out the referent. For value
+                // returns the boxing thunk is not materialized at all: invoke()
+                // goes through invoke_into() and the descriptor's boxed_allocate.
+                if constexpr (boxable && returns_reference<M>())
                 {
                     if constexpr (conversion)
                     {
@@ -5808,6 +6691,20 @@ consteval auto make_method_desc(const TypeDescriptor* declaring, const TypeDescr
                     else
                     {
                         desc.invoke_ref = make_ref_invoker<M>(indices);
+                    }
+                }
+                else
+                {
+                    // Zero-allocation path: the caller supplies the storage for
+                    // the result (api_design §11). Not for `&&`-qualified members
+                    // (the receiver is an lvalue here) and not for references.
+                    if constexpr (conversion)
+                    {
+                        desc.invoke_into = make_conversion_into_invoker<M>();
+                    }
+                    else
+                    {
+                        desc.invoke_into = make_into_invoker<M>(indices);
                     }
                 }
 
@@ -5851,7 +6748,7 @@ consteval auto make_method_desc(const TypeDescriptor* declaring, const TypeDescr
 template<meta::info C>
 consteval auto public_ctor_count() -> std::size_t
 {
-    if constexpr (is_unqualified_class(C) && !is_std_type(C))
+    if constexpr (expandable_type<C>())
     {
         std::size_t count = 0;
         for (auto member : meta::members_of(C, public_context()))
@@ -5910,7 +6807,7 @@ consteval auto max_ctor_parameters() -> std::size_t
 template<meta::info C>
 consteval auto declared_ctor_count() -> std::size_t
 {
-    if constexpr (is_unqualified_class(C) && !is_std_type(C))
+    if constexpr (expandable_type<C>())
     {
         std::size_t count = 0;
         for (auto member : meta::members_of(C, unchecked_context()))
@@ -6235,7 +7132,7 @@ consteval auto dynamic_array_name(bool simple) -> std::string_view
 template<meta::info E>
 consteval auto enumerator_count() -> std::size_t
 {
-    if constexpr (meta::is_enum_type(E) && !is_std_type(E))
+    if constexpr (meta::is_enum_type(E) && (!is_std_type(E) || is_deep_type<E>()))
     {
         return meta::enumerators_of(E).size();
     }
@@ -6356,6 +7253,19 @@ consteval auto make_descriptor(const Class* self, const void* fields, std::size_
     {
         desc.release = &release_thunk<Self>;
         desc.destroy = &destroy_thunk<Self>;
+        // invoke() boxes a result through invoke_into(): raw storage that the
+        // thunk placement-constructs into, then a release that destroys the value
+        // and deallocates the same block. Aligned new/delete are used for every
+        // type so the pair always matches, over-aligned or not.
+        desc.boxed_allocate = +[]() -> void*
+        {
+            return ::operator new(sizeof(Self), std::align_val_t(alignof(Self)));
+        };
+        desc.boxed_release = +[](void* data, const TypeDescriptor*) -> void
+        {
+            std::destroy_at(static_cast<Self*>(data));
+            ::operator delete(data, std::align_val_t(alignof(Self)));
+        };
         if constexpr (meta::is_copy_constructible_type(C))
         {
             desc.clone = &clone_thunk<Self>;
@@ -6478,6 +7388,16 @@ inline constexpr TypeBundle<T> bundle = []() consteval -> TypeBundle<T>
     constexpr auto public_methods = collect_methods<T>();
     constexpr auto declared_fields = collect_declared_fields<T>();
     constexpr auto declared_methods = collect_declared_methods<T>();
+
+    constexpr std::size_t reflected_member_count =
+        public_field_count<C>() + public_method_count<C>() + public_ctor_count<C>() + base_count<C>();
+    static_assert(reflected_member_count <= kMemberLimit,
+                  guard_message<C>("reflected members", reflected_member_count, kMemberLimit,
+                                   "split the type, or raise speculo::detail::kMemberLimit"));
+    static_assert(template_argument_count<C>() <= kTemplateArgumentLimit,
+                  guard_message<C>("template arguments", template_argument_count<C>(), kTemplateArgumentLimit,
+                                   "reduce the template's arity, or raise speculo::detail::kTemplateArgumentLimit"));
+
     TypeBundle<T> b{};
 
     [&]<std::size_t... I>(std::index_sequence<I...>)
@@ -7030,9 +7950,23 @@ template<typename T>
 auto Object::from_value(T value) -> Outcome<Object>
 {
     using U = std::remove_cvref_t<T>;
+    const detail::TypeDescriptor* desc = std::addressof(detail::descriptor_of_ref<U>());
+    if (Allocator* allocator = get_default_allocator())
+    {
+        const detail::BoxedStorage storage = detail::allocate_with(*allocator, desc);
+        if (storage.data == nullptr)
+        {
+            return Error{ErrorKind::NotSupported,
+                         "Object::from_value(): the default allocator returned no storage"};
+        }
+
+        ::new (storage.data) U(std::move(value));
+        return from_raw_with_release(storage.data, desc, storage.release);
+    }
+
     U* data = new U(std::move(value));
 
-    return from_raw(data, std::addressof(detail::descriptor_of_ref<U>()));
+    return from_raw(data, desc);
 }
 
 template<typename T, typename... CtorArgs>
@@ -7040,9 +7974,23 @@ template<typename T, typename... CtorArgs>
 auto Object::make(CtorArgs&&... args) -> Outcome<Object>
 {
     using U = std::remove_cvref_t<T>;
+    const detail::TypeDescriptor* desc = std::addressof(detail::descriptor_of_ref<U>());
+    if (Allocator* allocator = get_default_allocator())
+    {
+        const detail::BoxedStorage storage = detail::allocate_with(*allocator, desc);
+        if (storage.data == nullptr)
+        {
+            return Error{ErrorKind::NotSupported,
+                         "Object::make(): the default allocator returned no storage"};
+        }
+
+        ::new (storage.data) U(std::forward<CtorArgs>(args)...);
+        return from_raw_with_release(storage.data, desc, storage.release);
+    }
+
     U* data = new U(std::forward<CtorArgs>(args)...);
 
-    return from_raw(data, std::addressof(detail::descriptor_of_ref<U>()));
+    return from_raw(data, desc);
 }
 
 template<typename T>
@@ -7120,4 +8068,105 @@ template<typename T>
     return class_of<T>();
 }
 
+/**
+ * @brief Formats an object field-by-field (api_design §16)
+ * @param value The object to describe (non-owning view)
+ * @return `"<null>"` for a null view; otherwise `Type { a = 1, b = text }`,
+ *         with `<unprintable>` for a field whose type has no std::formatter
+ * @note One level only: a field whose type is itself an Object is formatted
+ *       through its own std::formatter / operator<< if it has one, never by
+ *       recursing into this function. Static fields are skipped.
+ */
+[[nodiscard]] auto to_string(ObjectRef value) -> std::string
+{
+    if (value.is_null())
+    {
+        return "<null>";
+    }
+
+    // Reading a volatile object through this diagnostic path would strip the
+    // qualifier without an explicit volatile access, so it is refused instead.
+    if (value.is_volatile())
+    {
+        return "<volatile>";
+    }
+
+    const Class& type = value.type();
+    std::string text(type.get_normalized_name());
+    text += " {";
+
+    bool first = true;
+    for (const Field& field : type.get_fields())
+    {
+        if (field.is_static())
+        {
+            continue;
+        }
+
+        text += first ? " " : ", ";
+        first = false;
+        text += field.get_name();
+        text += " = ";
+
+        const detail::FieldFormatFn format = detail::Access::field_format(field);
+        text += format != nullptr ? format(value.raw_data()) : std::string("<unprintable>");
+    }
+
+    text += first ? "}" : " }";
+    return text;
+}
+
 } // namespace speculo
+
+/**
+ * @brief Forces full materialization of a standard-library specialization
+ *        (SPECULO_DEEP; api_design §14)
+ *
+ * The macro expands to a specialization of `detail::deep_materialized<T>` plus a
+ * static initializer calling this function, so the (now deep) descriptor table is
+ * emitted even when the program only looks the type up by name.
+ */
+export namespace speculo::detail
+{
+
+template<typename T>
+void deep_materialize()
+{
+    (void)class_of<std::remove_cvref_t<T>>();
+}
+
+} // namespace speculo::detail
+
+/// `std::format("{}", cls)` -> Class::describe()
+template<>
+struct std::formatter<speculo::Class> : std::formatter<std::string_view>
+{
+    auto format(const speculo::Class& cls, std::format_context& ctx) const
+    {
+        const std::string text = cls.describe();
+        return std::formatter<std::string_view>::format(text, ctx);
+    }
+};
+
+/// `std::format("{}", field)` -> "Point::x"
+template<>
+struct std::formatter<speculo::Field> : std::formatter<std::string_view>
+{
+    auto format(const speculo::Field& field, std::format_context& ctx) const
+    {
+        const std::string text =
+            std::format("{}.{}", field.get_declaring_class().get_qualified_name(), field.get_name());
+        return std::formatter<std::string_view>::format(text, ctx);
+    }
+};
+
+/// `std::format("{}", object)` -> to_string(ObjectRef)
+template<>
+struct std::formatter<speculo::Object> : std::formatter<std::string_view>
+{
+    auto format(const speculo::Object& object, std::format_context& ctx) const
+    {
+        const std::string text = speculo::to_string(object.cref());
+        return std::formatter<std::string_view>::format(text, ctx);
+    }
+};

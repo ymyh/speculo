@@ -49,7 +49,10 @@ public:
 
     /// Whether invoke() can run this function (false for deleted, C-variadic, and
     /// signatures the thunk cannot express, such as a move-only by-value parameter).
-    [[nodiscard]] auto is_invokable() const -> bool { return m_desc->invoke != nullptr; }
+    [[nodiscard]] auto is_invokable() const -> bool
+    {
+        return m_desc->invoke != nullptr || m_desc->invoke_into != nullptr;
+    }
 
     [[nodiscard]] auto returns_reference() const -> bool
     {
@@ -151,23 +154,136 @@ public:
             return checked.unwrap_err();
         }
 
-        if (m_desc->invoke == nullptr)
+        if (returns_reference())
+        {
+            if (m_desc->invoke == nullptr)
+            {
+                const char* reason = is_deleted() ? "the function is deleted"
+                                     : is_ref_invokable() ? "the referenced result is not copyable (use invoke_ref())"
+                                                          : "the function is not available";
+                return Error{ErrorKind::NotSupported, std::format("{}: {}", context("Function::invoke"), reason)};
+            }
+
+            const detail::ArgumentPointers pointers(args);
+            void* result = m_desc->invoke(nullptr, pointers.data());
+            if (result == nullptr)
+            {
+                return Object{};
+            }
+
+            return detail::Access::adopt_object(result, m_desc->return_type->decayed);
+        }
+
+        if (m_desc->invoke_into == nullptr)
         {
             const char* reason = is_deleted() ? "the function is deleted"
                                  : is_variadic() ? "a C variadic function cannot be called through this handle"
-                                 : is_ref_invokable() ? "the referenced result is not copyable (use invoke_ref())"
-                                                      : "the function is not available";
+                                                 : "the function is not available";
             return Error{ErrorKind::NotSupported, std::format("{}: {}", context("Function::invoke"), reason)};
         }
 
         const detail::ArgumentPointers pointers(args);
-        void* result = m_desc->invoke(nullptr, pointers.data());
-        if (result == nullptr)
+        if (m_desc->return_type->kind == TypeKind::Void)
         {
+            m_desc->invoke_into(nullptr, nullptr, pointers.data());
             return Object{};
         }
 
-        return detail::Access::adopt_object(result, m_desc->return_type->decayed);
+        const detail::BoxedStorage storage = detail::allocate_boxed_storage(m_desc->return_type->decayed);
+        if (storage.data == nullptr)
+        {
+            return Error{ErrorKind::NotSupported,
+                         std::format("{}: no storage for the result (the allocator refused)",
+                                     context("Function::invoke"))};
+        }
+
+        m_desc->invoke_into(storage.data, nullptr, pointers.data());
+        return detail::Access::adopt_object(storage.data, m_desc->return_type->decayed, storage.release);
+    }
+
+    /**
+     * @brief Calls the function, constructing the result into `dst` (api_design §11)
+     * @param dst Storage for the result, aligned for the declared return type;
+     *            ignored for a void function
+     * @return NotSupported for a reference-returning or variadic function;
+     *         the argument errors of invoke()
+     * @note A null / misaligned `dst` is a precondition failure (`panic`). This
+     *       path performs no allocation.
+     */
+    [[nodiscard]] auto invoke_into(void* dst, Args args = {}) const -> Status
+    {
+        const Status checked = check_call("Function::invoke_into", args);
+        if (checked.is_err())
+        {
+            return checked.unwrap_err();
+        }
+
+        if (returns_reference())
+        {
+            return Error{ErrorKind::NotSupported,
+                         std::format("{}: the function returns a reference; invoke_into() does not copy it (use invoke_ref())",
+                                     context("Function::invoke_into"))};
+        }
+
+        if (m_desc->invoke_into == nullptr)
+        {
+            const char* reason = is_deleted() ? "the function is deleted"
+                                 : is_variadic() ? "a C variadic function cannot be called through this handle"
+                                                 : "the function is not available";
+            return Error{ErrorKind::NotSupported, std::format("{}: {}", context("Function::invoke_into"), reason)};
+        }
+
+        const bool is_void = m_desc->return_type == nullptr || m_desc->return_type->kind == TypeKind::Void;
+        if (!is_void)
+        {
+            if (dst == nullptr)
+            {
+                crab_cpp::panic("speculo: Function::invoke_into() requires non-null storage");
+            }
+
+            const std::size_t alignment = m_desc->return_type->decayed->alignment;
+            if (alignment != 0 && reinterpret_cast<std::uintptr_t>(dst) % alignment != 0)
+            {
+                crab_cpp::panic("speculo: Function::invoke_into() destination is not aligned for the return type");
+            }
+        }
+
+        const detail::ArgumentPointers pointers(args);
+        m_desc->invoke_into(is_void ? nullptr : dst, nullptr, pointers.data());
+
+        return None{};
+    }
+
+    /**
+     * @brief Calls the function into an existing owning Object (api_design §11)
+     * @param dst A non-empty Object holding the function's return type
+     * @return InvalidArgument when the function returns void or `dst` is empty;
+     *         TypeMismatch when `dst` holds another type; otherwise invoke_into's errors
+     */
+    [[nodiscard]] auto invoke_into(Object& dst, Args args = {}) const -> Status
+    {
+        const bool is_void = m_desc->return_type == nullptr || m_desc->return_type->kind == TypeKind::Void;
+        if (is_void)
+        {
+            return Error{ErrorKind::InvalidArgument,
+                         std::format("{}: the function returns void, so it has no destination value",
+                                     context("Function::invoke_into"))};
+        }
+
+        if (dst.is_null())
+        {
+            return Error{ErrorKind::InvalidArgument,
+                         std::format("{}: the destination Object is empty", context("Function::invoke_into"))};
+        }
+
+        if (detail::Access::descriptor(dst) != m_desc->return_type->decayed)
+        {
+            return Error{ErrorKind::TypeMismatch,
+                         std::format("{}: the destination holds another type, not '{}'", context("Function::invoke_into"),
+                                     m_desc->return_type->decayed->qualified_name)};
+        }
+
+        return invoke_into(dst.raw_data(), std::move(args));
     }
 
     /**
@@ -381,6 +497,27 @@ consteval auto make_free_invoker(std::index_sequence<I...>) -> InvokeFn
 }
 
 template<meta::info F, std::size_t... I>
+consteval auto make_free_into_invoker(std::index_sequence<I...>) -> InvokeIntoFn
+{
+    using FnType = typename[: meta::type_of(F) :];
+    using R = typename[: meta::return_type_of(F) :];
+    using FP = typename static_function_pointer<FnType>::type;
+
+    return +[](void* dst, void*, const void* const* args) -> void
+    {
+        constexpr FP function = meta::extract<FP>(F);
+        if constexpr (std::is_void_v<R>)
+        {
+            function(load_argument<F, I>(args)...);
+        }
+        else
+        {
+            ::new (dst) std::remove_cvref_t<R>(function(load_argument<F, I>(args)...));
+        }
+    };
+}
+
+template<meta::info F, std::size_t... I>
 consteval auto make_free_ref_invoker(std::index_sequence<I...>) -> InvokeRefFn
 {
     using FnType = typename[: meta::type_of(F) :];
@@ -473,13 +610,19 @@ consteval auto make_function_desc(const Class* const* parameters, const TypeDesc
     }
     else if constexpr (parameters_are_loadable<F>(indices))
     {
-        if constexpr (result_is_boxable<F>())
+        if constexpr (result_is_boxable<F>() && returns_reference<F>())
         {
+            // Only reference results need the boxing thunk; value results go
+            // through invoke_into() + boxed_allocate.
             desc.invoke = make_free_invoker<F>(indices);
         }
         if constexpr (returns_reference<F>())
         {
             desc.invoke_ref = make_free_ref_invoker<F>(indices);
+        }
+        else
+        {
+            desc.invoke_into = make_free_into_invoker<F>(indices);
         }
     }
 

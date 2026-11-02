@@ -90,6 +90,11 @@ TEST(ObjectTest, MoveOnlySemantics)
     static_assert(!std::is_copy_constructible_v<speculo::Args>);
     static_assert(std::is_move_constructible_v<speculo::Args>);
 
+    // Phase 12: the per-object release thunk is one extra pointer.
+    static_assert(sizeof(speculo::Object) == 3 * sizeof(void*));
+    static_assert(sizeof(speculo::ObjectRef) == 24);
+    static_assert(sizeof(speculo::Class) == sizeof(void*));
+
     EXPECT_TRUE(true);
 }
 

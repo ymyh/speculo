@@ -6,7 +6,7 @@ import speculo;
 
 TEST(SkeletonTest, ModuleImportsAndLinks)
 {
-    EXPECT_EQ(speculo::version_string(), "0.1.0");
+    EXPECT_EQ(speculo::version(), "0.1.0");
 }
 
 TEST(SkeletonTest, CrabCppDependencyLinks)

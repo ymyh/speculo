@@ -6,13 +6,24 @@ import speculo;
 
 // BaseClass::get_offset (api_design §6).
 //
-// 基类形状 × get_offset()  —— 返回 Option
-//  | 基类            | Some(offset) | 说明                                   |
-//  | 非虚基（第 1 个）| 0            | 派生对象起点就是它                     |
-//  | 非虚基（后续）   | 真实偏移     | 与 cast_to 的地址差一致                |
-//  | 空基             | 0            | EBO 生效                               |
-//  | 虚基             | None         | 没有静态偏移（随完整对象变化，S8.10）  |
-//  | protected/private 基 | None     | 命名空间作用域无法上转                 |
+// The API has no parameters, so the single value-class axis is the shape of the
+// `BaseClass` value it is called on (testing.md §2). One row per value class; the
+// product is 6 cells, all asserted, no second dimension.
+//
+//  | 值类 | 基类形态                      | get_offset()          | 断言位置 |
+//  |------|-------------------------------|-----------------------|----------|
+//  | V0   | 非虚 public 基（第一个）      | Some(0)               | NonVirtualBasesHaveStaticOffsets / OffsetAgreesWithCastTo |
+//  | V0   | 非虚 public 基（后续）        | Some(真实偏移)         | 同上（与 cast_to 地址差一致） |
+//  | V1   | 偏移 0 的边界（第一个基、EBO）| Some(0)               | EmptyBaseOptimizationGivesZero |
+//  | V2   | 类型不符                      | N/A：没有实参，也没有第二个操作数 | — |
+//  | V3   | 默认构造的 BaseClass{}        | None（offset thunk 为 nullptr） | DefaultConstructedBaseClassHasNoOffset |
+//  | V4   | 视图修饰                      | N/A：BaseClass 不接收 ObjectRef，没有 const/volatile 视图 | — |
+//  | V5   | 虚基                          | None                  | VirtualBaseHasNoStaticOffset |
+//  | V5   | protected / private 基        | None                  | InaccessibleBaseHasNoOffset |
+//
+// Option 的三条 None 路径各有一条用例（虚基 / 不可访问基 / 默认构造）。
+// bool 维度：is_virtual() 与 modifiers.is_private() 的 true、false 两侧都有断言。
+// 注意 BaseClass 是聚合值而不是句柄，所以 V3 是 None 而不是 panic（api_design §6）。
 
 namespace
 {
@@ -123,6 +134,12 @@ TEST(BaseOffsetTest, NonVirtualBasesHaveStaticOffsets)
     EXPECT_EQ(bases[1].type->get_name(), "P2");
     EXPECT_EQ(bases[2].type->get_name(), "P3");
 
+    // bool false side: a public, non-virtual base reports neither bit.
+    EXPECT_FALSE(bases[0].modifiers.is_private());
+    EXPECT_FALSE(bases[0].modifiers.is_protected());
+    EXPECT_TRUE(bases[0].modifiers.is_public());
+    EXPECT_FALSE(bases[0].is_virtual());
+
     ASSERT_TRUE(bases[0].get_offset().is_some());
     EXPECT_EQ(bases[0].get_offset().unwrap(), 0u);
 
@@ -172,6 +189,7 @@ TEST(BaseOffsetTest, VirtualBaseHasNoStaticOffset)
     const speculo::BaseClass& base = cls.get_bases()[0];
 
     EXPECT_TRUE(base.is_virtual());
+    EXPECT_FALSE(base.modifiers.is_private());
     EXPECT_TRUE(base.get_offset().is_none());
 
     // The upcast thunk still works; only the static offset is unavailable.
@@ -186,8 +204,22 @@ TEST(BaseOffsetTest, InaccessibleBaseHasNoOffset)
     const speculo::BaseClass& base = cls.get_bases()[0];
 
     EXPECT_TRUE(base.modifiers.is_private());
+    EXPECT_FALSE(base.modifiers.is_public());
+    EXPECT_FALSE(base.is_virtual());
     EXPECT_TRUE(base.get_offset().is_none());
     EXPECT_EQ(base.cast, nullptr);
+}
+
+TEST(BaseOffsetTest, DefaultConstructedBaseClassHasNoOffset)
+{
+    // BaseClass is a plain aggregate, not a handle into the descriptor table, so
+    // "no base relationship" is expressed by the null thunk: get_offset() is None
+    // and no read through it panics (api_design §6).
+    const speculo::BaseClass none{};
+    EXPECT_EQ(none.type, nullptr);
+    EXPECT_EQ(none.cast, nullptr);
+    EXPECT_TRUE(none.get_offset().is_none());
+    EXPECT_TRUE(none.get_annotations().empty());
 }
 
 TEST(BaseOffsetTest, PolymorphicBaseOffsetsSkipTheVtablePointer)

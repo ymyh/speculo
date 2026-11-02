@@ -25,7 +25,9 @@ using SwapFn          = void (*)(void*, void*);         ///< exchange two object
 using FieldGetFn      = void* (*)(const void*);         ///< heap copy of a member value
 using FieldSetFn      = bool (*)(void*, const void*);   ///< copy-assign a member value
 using FieldRefFn      = void* (*)(void*);               ///< address of a subobject
+using FieldFormatFn   = std::string (*)(const void*);   ///< std::format("{}") of a member value
 using InvokeFn        = void* (*)(void*, const void* const*); ///< self + argument pointers
+using InvokeIntoFn    = void (*)(void* dst, void* self, const void* const*); ///< constructs the result into dst (no allocation)
 using InvokeRefFn     = const void* (*)(void*, const void* const*); ///< self + argument pointers -> address of the referent
 using CtorFn          = void* (*)(const void* const*);  ///< heap-construct from argument pointers
 using PlacementCtorFn = void (*)(void*, const void* const*);
@@ -40,6 +42,11 @@ using CallableInvokeRefFn = const void* (*)(const void* callable, void* self, co
 using BaseOffsetFn        = std::size_t (*)(); ///< base subobject offset; nullptr when there is none
 
 struct TypeDescriptor;
+
+/// Per-object release for storage that did not come from the type's own
+/// `release` (an Allocator-backed box, or a raw `boxed_allocate` block).
+using AllocatedReleaseFn = void (*)(void* data, const TypeDescriptor* desc);
+
 struct TemplateArgDesc;
 struct CallableDesc;
 
@@ -150,6 +157,7 @@ struct FieldDesc
     FieldGetFn get = nullptr;
     FieldSetFn set = nullptr;
     FieldRefFn get_ref = nullptr;
+    FieldFormatFn format = nullptr; ///< nullptr when std::formatter<F> is not available
 
     const void* annotations = nullptr; ///< const Annotation[]
     std::size_t annotation_count = 0;
@@ -177,6 +185,7 @@ struct MethodDesc
     bool is_conversion = false; ///< `operator T` (also carries Modifier::CONVERSION)
 
     InvokeFn invoke = nullptr;          ///< boxes a copy of the result (nullptr when it cannot be boxed)
+    InvokeIntoFn invoke_into = nullptr; ///< constructs the result into caller storage; lvalue receiver only
     InvokeRefFn invoke_ref = nullptr;   ///< reference-returning methods only: address of the referent, no copy
     InvokeFn invoke_rvalue = nullptr;   ///< rvalue receiver path; `&&`-qualified methods only have this one
 
@@ -215,6 +224,7 @@ struct FunctionDesc
     std::size_t template_argument_count = 0;
 
     InvokeFn invoke = nullptr;        ///< self is ignored; nullptr when the call cannot be made
+    InvokeIntoFn invoke_into = nullptr; ///< constructs the result into caller storage (no allocation)
     InvokeRefFn invoke_ref = nullptr; ///< reference-returning functions only
 
     const void* annotations = nullptr; ///< const Annotation[]
@@ -341,6 +351,11 @@ struct TypeDescriptor
     MoveCtorFn   move_ctor = nullptr;   ///< nullptr when the type is not move-constructible
     MoveAssignFn move_assign = nullptr; ///< nullptr when the type is not move-assignable
     SwapFn       swap = nullptr;        ///< nullptr unless move-constructible and move-assignable
+
+    /// Raw, uninitialized storage for one value, paired with boxed_release.
+    /// invoke() uses this to let invoke_into() construct the result in place.
+    void* (*boxed_allocate)() = nullptr;
+    AllocatedReleaseFn boxed_release = nullptr; ///< destroy in place + deallocate a boxed_allocate block
 
     const void* fields = nullptr;   ///< const Field[] (public members, own class)
     std::size_t field_count = 0;

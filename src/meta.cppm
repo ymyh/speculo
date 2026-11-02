@@ -62,6 +62,22 @@ struct reflect_impl_tag
 {
 };
 
+/**
+ * @brief Opt-in flag set by SPECULO_DEEP(T) (api_design §14)
+ *
+ * Standard-library types are materialized shallowly by default: names, size and
+ * the value operations an Object needs, but no member tables. `SPECULO_DEEP(T)`
+ * specializes this variable template for one specialization, which makes the
+ * collectors treat that type like a user type.
+ *
+ * The macro expands to an explicit specialization at namespace scope, so it must
+ * appear before the first `class_of<T>()` (or anything else that materializes T)
+ * in the translation unit; repeating it in one TU is a redefinition, while
+ * identical specializations in different translation units are fine.
+ */
+template<typename T>
+inline constexpr bool deep_materialized = false;
+
 } // namespace speculo::detail
 
 namespace speculo::detail
@@ -128,6 +144,33 @@ consteval auto is_std_type(meta::info type) -> bool
     }
 
     return is_in_std_namespace(type);
+}
+
+/**
+ * @brief Whether SPECULO_DEEP(T) opted this type into full materialization
+ * @note The flag lives in the same module, so the collectors and the macro see
+ *       the same specialization; only the type itself is affected (members are
+ *       not automatically deep).
+ */
+template<meta::info C>
+consteval auto is_deep_type() -> bool
+{
+    if constexpr (is_unqualified_class(C))
+    {
+        return deep_materialized<typename[: C :]>;
+    }
+    else
+    {
+        return false;
+    }
+}
+
+/// Whether a type's member tables are materialized: user classes always,
+/// std types only after SPECULO_DEEP.
+template<meta::info C>
+consteval auto expandable_type() -> bool
+{
+    return is_unqualified_class(C) && (!is_std_type(C) || is_deep_type<C>());
 }
 
 /**
@@ -243,7 +286,7 @@ template<meta::info C>
 consteval auto field_members() -> std::vector<meta::info>
 {
     std::vector<meta::info> result;
-    if constexpr (is_unqualified_class(C) && !is_std_type(C))
+    if constexpr (expandable_type<C>())
     {
         // Declaration order inside each group; non-static members come first so
         // the order matches Class::get_fields() (api_design §1).
@@ -263,7 +306,7 @@ template<meta::info C>
 consteval auto declared_field_members() -> std::vector<meta::info>
 {
     std::vector<meta::info> result;
-    if constexpr (is_unqualified_class(C) && !is_std_type(C))
+    if constexpr (expandable_type<C>())
     {
         for (meta::info member : meta::nonstatic_data_members_of(C, unchecked_context()))
         {
@@ -281,7 +324,7 @@ template<meta::info C>
 consteval auto method_members() -> std::vector<meta::info>
 {
     std::vector<meta::info> result;
-    if constexpr (is_unqualified_class(C) && !is_std_type(C))
+    if constexpr (expandable_type<C>())
     {
         for (meta::info member : meta::members_of(C, public_context()))
         {
@@ -298,7 +341,7 @@ template<meta::info C>
 consteval auto declared_method_members() -> std::vector<meta::info>
 {
     std::vector<meta::info> result;
-    if constexpr (is_unqualified_class(C) && !is_std_type(C))
+    if constexpr (expandable_type<C>())
     {
         for (meta::info member : meta::members_of(C, unchecked_context()))
         {

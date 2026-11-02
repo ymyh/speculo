@@ -467,6 +467,9 @@ method.invoke(obj, {std::string("x")});   // 不能编译
 - 仓库没有 `README`。构建命令只写在 `AGENTS.md` 和 `phases.md`。`phases.md` 把 README 标成可选；作为要给人用的库，快速开始和「实参必须是左值、匹配是精确类型」这两条应该放在用户看得到的地方。
 - 其它文档大量指向本文件的「Phase 0–7」偏差记录。本次审核开始时本文件是空的，那些阶段记录不在仓库里。阶段摘要还在 `phases.md`。本文件从这次起改为问题清单，不再补写一份阶段日志。
 - `version_string()` 固定返回 `"0.1.0"`，没有和标签或变更记录对应。`phases.md` 已建议删掉或做成真版本。
+  > **已处理（Phase 13）**：改名为 `speculo::version()`，值来自构建系统传入的 `SPECULO_VERSION`
+  > （CMake 取 `project(... VERSION)`，xmake 取 `xmake.lua` 顶部的 `_speculo_version`），
+  > 源码里只留一份兜底宏。见 review.md §13.2。
 - CMake 的测试源和示例源用 `file(GLOB)` 且没有 `CONFIGURE_DEPENDS`。新增文件不重新 configure 就不会编进去。`phases.md` 写过，仍然容易漏。
 - MinGW 链接使用 `-Wl,--allow-multiple-definition` 掩盖 libstdc++ `import std` 的重复符号（GCC PR116746）。这是工具链限制，但也会放过本库自己的 ODR 违例。
 - `src/object.cppm` 约 3200 行，API、thunk、物化全在一个分区。模块依赖环迫使如此（`phases.md` 的雷区 1）。文件内部至少应按「句柄 / thunk / bundle」分成清晰的区段边界；现在改一个匹配规则要在 3000 行里找所有 decay 比较点（`Field::set`、`Method::invoke`、`Constructor::validate`、`matches_arguments`、`Array::set` 各写了一次）。
@@ -651,9 +654,15 @@ S8 没有覆盖「这些能力能不能被**物化**进运行期描述表」，P
 | `aggregate_test.cpp` | 7 | 伪构造函数描述、基类+成员填充、`construct_at`/`destroy_at`、`Object::make_aggregate`、const/引用槽位、5 类不支持形状、错误顺序 |
 | `nested_type_test.cpp` | 4 | 声明序、别名/模板/不完整/继承的排除、访问级别、类模板实例内的嵌套、`enclosing` |
 | `layout_traits_test.cpp` | 6 | 6 个单类型谓词 × 10 类类型与 `<type_traits>` 交叉验证、非类类型返回 false、联合体、`is_bit_castable_to`、4 个双类型谓词与 trait 交叉验证（含操作数顺序） |
-| `base_offset_test.cpp` | 7 | 多基偏移、EBO、与 `cast_to` 的两路一致性、虚基/私有基 `None`、含 vptr 的基、无基类 |
+| `base_offset_test.cpp` | 8 | 多基偏移、EBO、与 `cast_to` 的两路一致性、虚基/私有基 `None`、含 vptr 的基、无基类、默认构造 `BaseClass{}` 的 `None` |
 
 `Clang`/MSVC 未验证（本库只面向 GCC 16+）。双构建系统（CMake + xmake）均全绿。
+
+> **补测（Phase 13 审计，用 `speculo-tests` skill 的门禁复检）**：`base_offset_test.cpp` 原先
+> 缺三格——`BaseClass{}`（V3）的 `None`、`Option` 的第三条 `None` 路径、以及 `bool` 的 false
+> 侧（`is_private()` / `is_virtual()` 只断了 true）。已补齐并把「值类 × 期望」表改写进文件头
+> （含 V2 / V4 的 N/A 理由）。同时发现一条未写进契约的语义：`BaseClass` 是聚合值而非句柄，
+> 所以 V3 是 `None` 而不是 `panic`——已补进 api_design §6。用例数 7 → 8。
 
 ## 10. Phase 10：操作语义（2026-11-02 完成）
 
@@ -756,3 +765,131 @@ S8 没有覆盖「这些能力能不能被**物化**进运行期描述表」，P
 `MemberKind::Destructor` 与运行期析构名一致。
 
 `Clang`/MSVC 未验证（本库只面向 GCC 16+）。双构建系统（CMake + xmake）均全绿。
+
+## 12. Phase 12：工程化（2026-11-02 完成）
+
+环境同上（MSYS2 ucrt64 GCC 16.2.0，`-std=c++26 -freflection -fno-rtti -fno-exceptions`）。
+落地内容：`InvokeIntoFn` + `Method` / `Function::invoke_into`（`void*` / `Object&`）、
+`Allocator` / `ArenaAllocator` / 线程局部默认分配器、`Class::new_instance_with` /
+`new_aggregate_with`、类型身份（`operator==` 三分支 + `get_type_id` + `std::hash<Class>`）、
+`SPECULO_DEEP`、`describe` / `to_string` / 三个 `std::formatter`、成员数与模板实参数护栏。
+`ctest` 6/6，371 个用例全绿（新增 47 个）；`xmake test` 6/6。
+
+### 12.1 实现偏差（已回写 `api_design.md` §11–§14、§16 与 `design.md` §15.3）
+
+| 项 | 原设计 | 实际 | 原因 |
+|---|---|---|---|
+| `Object` 布局 | 「释放函数指针 + 分配块指针」，暗示 16 字节 | 数据指针 + 描述符 + per-object release = 24 字节；块指针在值前的 `AllocationHeader` 里 | 分配器释放需要知道「用哪个分配器释放哪一块」；把 header 放在值前，per-object 只多一个 thunk，比再存两个指针省 8 字节 |
+| 默认分配器拒绝分配 | 未定义 | `invoke` / `from_value` / `new_instance` 返回 `NotSupported`，**不**回退到全局 `new` | 静默回退会让「计数分配器验证零分配」之类的断言失去意义；显式失败比隐式换路径可诊断 |
+| `invoke_into` 的接收者 | 未限定 | 只有左值接收者；`&&` 限定方法返回 `NotSupported`（指向 `invoke_rvalue`） | 没有 `invoke_rvalue_into`；右值接收者的结果构造语义另需一套 thunk，v2 不做 |
+| `invoke` 的装箱 | 「`allocate + invoke_into + dtor`」 | 非引用返回走 `boxed_allocate + invoke_into`（不再生成 boxing thunk）；**引用返回**仍用旧 boxing thunk | `invoke` 对引用返回的契约是「拷贝 referent」，`invoke_into` 明确拒绝引用；两条路径共存 |
+| `SPECULO_DEEP` 幂等 | 「重复标注幂等」 | 不同 TU 的相同标注可以；**同一 TU 重复标注是重定义错误** | 宏展开为变量模板显式特化，C++ 无法对同一特化做「加一次」；见 §12.2 的可见性限制 |
+| `describe()` 的成员范围 | 「名字/尺寸/对齐/修饰符/字段与方法签名」 | 只列 **public** 字段与方法（`get_fields` / `get_methods`） | 诊断面向使用者；私有成员用 `get_declared_*`，避免把默认私有成员全打出来 |
+| `formatter<Field>` | 「委托给上述函数」，但 Field 没有 `describe` | 输出 `"限定名.字段名"` | Field 的稳定身份就是「哪个类的哪个成员」；签名不是 Field 的属性 |
+| `get_type_id` 的非规范名类型 | 未定义 | 取 `fnv1a64(qualified_name)`，不进入 id 表 | 匿名类型无法跨 DSO 统一；至少要保证进程内稳定，且 `Class{}` 的 id 为 0 |
+
+### 12.2 已知限制与踩坑
+
+- **`SPECULO_DEEP` 的可见性**：显式特化必须出现在每个会物化该类型的 TU；只在一个 TU
+  标注、另一个 TU 也调用 `class_of<T>()` 会实例化出内容不同的 `bundle<T>`（ODR 违规）。
+  已在 `api_design.md` §14 与宏注释写死。
+- **GCC 16.2 模块序列化 bug**：在**导出的类内联成员函数体**里写局部 lambda（`describe()`
+  最初的实现）会让 `speculo:object` 的 `.gcm` 无法回读——
+  `failed to read compiled module cluster N: Bad file data`。把 `kind_name` 的 switch
+  移到命名空间作用域的 `detail::type_kind_name()` 后消失。以后导出类的内联函数体
+  尽量避免局部 lambda。
+- **跨 DSO 身份没有真测试**：单进程两份 TU 会被链接器合并弱符号，测不出第三条分支
+  （testing.md §9 明确禁止假测试）。当前只覆盖 id 契约、hash 契约与非规范名路径；
+  同名描述符的比较逻辑靠代码审查 + 文档保证。
+- **整文件重写注意编码**：本阶段用 `Set-Content -NoNewline -Encoding utf8` 做过批量
+  文本替换；后续不要用 `Get-Content/Set-Content` 整文件重写（会改编码 / 行尾）。
+
+### 12.3 测试
+
+新增 / 扩展的用例按 .agents/testing.md §2–§5：
+
+| 文件 | 用例数 | 覆盖 |
+|---|---|---|
+| `tests/invoke_into_test.cpp` | 13（含 24 + 16 个矩阵格） | `void*` / `Object&` 两个重载 × 标量 / void / 非平凡 / 静态 / 引用 / `&&`（Method）与标量 / void / 引用 / 变参（Function）；const / volatile / 空 / 错类型接收者；`= delete` / C 变参；转换运算符；`>8` 实参堆路径；`dst` 空与未对齐 panic；0 分配 vs `invoke` 1 分配 |
+| `tests/allocator_test.cpp` | 16（含 2 × 5 个矩阵格） | 计数 / 拒绝分配器 × 匹配 / 歧义 / 已删除 / 抽象 / 无匹配；构造失败归还块；`new_aggregate_with` 槽位错误也归还块；过对齐（64 字节）；arena 批量释放；默认分配器覆盖构造 / `make` / 自由函数 invoke；拒绝时不回退；线程局部语义 |
+| `tests/type_identity_test.cpp` | +3 | id 稳定 / 不同类型不同 id、`unordered_set` / `unordered_map` 与 hash 一致、空句柄 id 与 hash 均为 0、非规范名（动态数组）id 与 `!=` |
+| `tests/deep_std_test.cpp` | 4 | `SPECULO_DEEP` 后方法 / 构造可见、不传播到成员、未标注 std 类型仍浅、`describe` 能看到深成员 |
+| `tests/diagnostics_test.cpp` | 11 | `describe` 全文快照 + 结构、只列 public、`to_string` 逐字段 / 静态跳过 / 数组与 volatile 字段 `<unprintable>` / volatile 视图、`<null>`、浅 std 类型、私有 `Field` formatter、三个 formatter 的委托 |
+
+`Object` 布局静态断言（24 字节）加在 `tests/object_test.cpp`；`Class` 仍是 8 字节。
+双构建系统（CMake + xmake）均全绿。
+
+## 13. Phase 13：关系图与收尾（2026-11-02 完成）
+
+环境同上（MSYS2 ucrt64 GCC 16.2.0，`-std=c++26 -freflection -fno-rtti -fno-exceptions`）。
+落地内容：注册表 v2（反向边索引 `derived` + 已注册类清单 `all`）、`Class::get_derived_classes` /
+`get_all_derived_classes` / `is_derived_from` / `get_conversion_path`、
+`Method::get_overridden_method` / `get_overrider_methods`、`speculo::version()`（版本号由
+`SPECULO_VERSION` 宏从构建系统传入）、`examples/06_proxy_demo.cpp`（ngcpp/proxy 4.1.0）。
+`ctest` 7/7，387 个用例全绿（新增 16 个）；xmake 7/7。
+
+### 13.1 探针（`spikes/s13_graph.cpp`）
+
+| 覆盖 | 结论 |
+|---|---|
+| `display_string_of` 对 typedef / 别名 / `std::size_t` / `const int&` / `int[3]` 的输出 | GCC 16.2 **不产生** `{aka ...}`（`NamedAlias` 直接给 `Named`，`size_t` 给 `long long unsigned int`）。`{aka}` 只出现在诊断文本里，故 `get_qualified_name()` 的别名显示问题在 16.2 上不存在；`normalize_type_name` 的剥离保持为防御措施，`registry_test.cpp` 已有「带 `{aka}` 的查询名」用例钉住 |
+| `is_virtual` / `is_override` / `is_pure_virtual` 在派生类方法上的取值 | 三项都准确（`override` 关键字命中 `is_override`），可用于人工核对；运行期匹配仍按签名做，不依赖 `is_override`（隐式覆盖不写关键字） |
+| vtable 槽位号 | `<meta>` 无任何相关 facility（`meta` 头里只有 `is_virtual` / `is_pure_virtual` / `is_override` / `has_virtual_destructor`）。`Method::get_vtable_index` 因此**不实现**，见 `api_design.md` §17 |
+
+### 13.2 实现偏差（已回写 `api_design.md` §0.1 / §15 / §17、`design.md` §11、`phases.md`）
+
+| 项 | 原设计 | 实际 | 原因 |
+|---|---|---|---|
+| `Method::get_vtable_index` | 「⚠️ 待 spike，可能恒为 None」 | **不提供** | 恒 `None` 的接口只增加噪声；真槽号要读 Itanium ABI 的私有 vtable，与「不依赖 ABI 私有细节」冲突。整条移入 §17 |
+| `get_conversion_path` 的错误口径 | 「0 条 → `TypeMismatch`，>1 条 → `Ambiguous`」 | 与 `cast_to` 三分支对齐：完全无关 → `TypeMismatch`；仅 protected/private → `NotSupported`；不同子对象 >1 → `Ambiguous` | 「不是基类」与「是基类但不可访问」是两种不同的用户错误，合并会让人无从修正；同一张图用同一套错误码 |
+| 虚继承菱形的路径判定 | 未写 | 所有路径都经虚基进入目标 → 算一条（取最短）；否则 `Ambiguous` | 虚基在整个对象里唯一，这正是 `cast_to` 比较地址所表达的同一件事；静态上可用「最后一跳是否虚基边」判定，无需对象 |
+| `is_derived_from` 的自身判定 | 「传递闭包」 | **不含自身**（`D.is_derived_from(D)` 为 false） | 与名字一致；身份判定用 `==`，`get_conversion_path` 才是把 identity 算一条路径的那个 |
+| 覆盖匹配键 | 「名字 + 形参**退化**类型 + `const`」 | 名字 + 形参**精确**类型 + `const` / `volatile` / ref-qualifier，且基类侧与自身都必须 `virtual` | 退化会让 `void f(int)` 与 `void f(const int&)`、`f() const` 与 `f()` 误判成覆盖——那在 C++ 里只是隐藏。C++ 的覆盖规则本来就要求形参类型完全相同 |
+| 反向边索引的键 | 「base → derived」 | 键是基类的 `normalized_name`，不是描述符指针 | 与 `Class::operator==` 的第二条分支（跨 DSO 同名即同类）口径一致；指针键会让两份库副本各建一套索引 |
+| `version_string()` | 「删除占位」 | 改名 `version()`，值来自 `SPECULO_VERSION` 宏（CMake `project(... VERSION)` 与 xmake 各自定义，源码里留一份兜底） | 版本号属于构建系统，不该硬编码在模块里；`version()` 返回的是「本模块被编译时的版本」 |
+
+### 13.3 关系图的语义边界（已写进 README「Type graph」与 `api_design.md` §15.2）
+
+- **只覆盖已注册类型**。`class_of<T>()` 首次调用或 `SPECULO_REGISTER` 才会把类写进表；反向边也
+  只在**首次**注册时建立（用「限定名键是否新建」判断），所以重复注册不会重复插边。这是本库与
+  Java 最大的语义差异，测试用 `tg::Unregistered`（有规范名、永不 `class_of`）钉住。
+- 空句柄在 `is_derived_from` / `get_conversion_path` 的**任一侧**都 `panic`：读空句柄是前置条件
+  违反，不返回 `false` / `Err`。为了不让「空 vs 空」走 `operator==` 短路成 `false`，两个入口都显式
+  摸一次 `get_qualified_name()`，让 `CheckedDesc` 负责报错。
+- 路径元素是 `descriptor->self`（`class_of<T>()` 的规范句柄），不是 `&*this`：否则
+  `class_of<D>().get_conversion_path(...)` 返回的指针会指向临时句柄。
+
+### 13.4 收尾项
+
+| 遗留项 | 处置 |
+|---|---|
+| `get_qualified_name()` 的 `{aka ...}` | 探针确认 GCC 16.2 不产生；不变更实现，保留归一化兜底与既有测试 |
+| 私有/保护构造函数不可 `new_instance` | 写进 `design.md` §11 第 10 条与 README「Limits」 |
+| `Array::new_instance` 元素为数组 | 写进 `design.md` §11 第 11 条与 README「Limits」；`can_dynamic_array` 本就排除数组 |
+| `SECONDARY` 示例 | 文档里只有这一处出现，判定为遗留笔误，已从 `phases.md` 删除 |
+| `proxy_demo` | 用社区接手的 [ngcpp/proxy](https://github.com/ngcpp/proxy) 4.1.0（微软已停止维护），`examples/06_proxy_demo.cpp`；CMake 用 `FetchContent` + `msft_proxy4` 目标，xmake 在 `xmake.lua` 里声明 `ngproxy` 包（与 crab_cpp 同一写法），两套构建系统保持对等 |
+
+### 13.5 测试（`tests/type_graph_test.cpp`，16 个用例 / 4 张矩阵）
+
+按 testing.md §3 的「P ≤ 64 走全笛卡尔积」执行：四张表都是完整乘积，**没有 N/A 格**——
+「不相关的接收者/目标组合」本身就是一个可断言的 `TypeMismatch`，不是未定义。
+
+| 矩阵 | 规模 | 覆盖 |
+|---|---|---|
+| `GraphMatrix.ConversionPathMatrixCoversEveryReceiverTargetPair` | 接收者 6 × 目标 8 = 48 格 | 直接基 / 2 跳 / 3 跳 / 虚菱形（一条路径）/ 非虚菱形 `Ambiguous` / 仅 protected-private `NotSupported` / 无关 `TypeMismatch`；每格断言 kind、路径长度与首尾句柄 |
+| `GraphMatrix.ConversionPathIdentityIsOneHop` | 6 格 | identity 对所有接收者都是 1 跳 |
+| `GraphMatrix.DerivedClassMatrixCoversEveryTypeForm` | 类型形态 4 × 查询 2 = 8 格 | 直接子类三者、后代含孙子、叶子、无子类、非类类型 |
+| `GraphMatrix.IsDerivedFromMatrixCoversEveryRelation` | 关系 10 | 正向 / 传递 / 反向 / 自身 / 私有 / 保护 / 无关（两侧）/ 歧义路径下的基类仍算派生 |
+| `GraphMatrix.OverrideMatrixCoversEveryMethodForm` | 方法形态 10 × 查询 2 = 20 格 | 覆盖链最近一层、链尽头、非虚（隐藏）、形参不同、cv 不同、非虚基类方法；覆盖者列表按名字排序，避免依赖注册顺序 |
+
+其余 12 个非矩阵用例覆盖：整条链路的元素顺序（含等长虚路径的取舍规则）、混合虚/非虚菱形仍是
+`Ambiguous`（`MixedBottom`）、两类派生查询的层序与层内位置、覆盖链逐跳回溯到根基类再 `None`、
+返回值是描述表里的规范句柄（不能是 `&*this` 这种临时）、`tg::Unregistered`（有规范名但永不物化）
+在两张派生查询里都不可见、覆盖者句柄可直接 `invoke`，以及空句柄 8 处 `panic`
+（`get_conversion_path` 两侧、`is_derived_from` 两侧、两个派生查询、两个覆盖查询）。
+
+注意 `Fixture` 的构造里显式 `class_of` 了所有表里提到的类型：注册是反向边的唯一来源，
+这样各用例之间没有执行顺序依赖（testing.md §8）。
+
+fixture 放在 `tests/support/type_graph_fixtures.h`（命名空间 `tg`：需要规范名做按名断言，
+并保留一个永不物化的 `tg::Unregistered`），`tests/README.md` 已登记。

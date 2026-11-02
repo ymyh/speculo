@@ -63,6 +63,22 @@ v2 要求：第 1–5 步有意的偏离（例如「先查能力再查类型」�
 | `Class::destroy(obj)` | obj 空（`NullInstance`）→ 类型（`TypeMismatch`）→ volatile（`NotSupported`）→ 可析构（`NotSupported`）。const 对象允许析构。 |
 | `Object::move_from(source)` | source 空（`NullInstance`）→ 目标非空且类型不同（`TypeMismatch`）→ 可移动构造（`NotSupported`）。 |
 
+**Phase 12 新增/变更的检查顺序**：
+
+| API | 检查顺序 |
+|---|---|
+| `Method::invoke_into(dst, obj, args)` | 与 `Method::invoke` 完全相同（实参个数 → 接收者空 → 接收者类型 → ref-qualifier → const → volatile → 逐参），然后：返回引用（`NotSupported`）→ 可调用能力（`NotSupported`；`&&` 限定提示用 `invoke_rvalue`）。`dst` 为空 / 未对齐是 `panic`（前置条件，不产生 `Err`）。 |
+| `Method::invoke_into(Object& dst, ...)` | void 返回（`InvalidArgument`）→ `dst` 空（`InvalidArgument`）→ `dst` 类型不符（`TypeMismatch`）→ 转入上面的 `void*` 重载。 |
+| `Function::invoke_into` | 与 `Function::invoke` 相同（实参个数 → 逐参），然后：返回引用（`NotSupported`）→ 可调用能力（`NotSupported`）。`Object&` 重载同 `Method`：void → 空 → 类型。 |
+| `Class::new_instance_with` | 与 `Class::new_instance` 相同的构造选择（抽象类 → `NotSupported`；有歧义 → `Ambiguous`；匹配到 `= delete` → `NotSupported`；无匹配 → `NotFound`），选中后分配失败 → `NotSupported`；构造失败按 `Constructor::construct_at` 的原因返回，已分配块被归还。 |
+| `Class::new_aggregate_with` | 能力（非聚合 / 槽位不可初始化 → `NotSupported`）→ 分配失败（`NotSupported`）→ `Constructor::construct_at` 的检查（个数 → 逐参）。 |
+
+`Method::invoke` / `Function::invoke` 的**分配失败**（设置了默认分配器但它返回 null）在能力检查之后返回 `NotSupported`。
+
+**Phase 13 新增/变更的检查顺序**：关系图的 6 个 API 见 @.agents/api_design.md §15.3（`get_conversion_path` /
+`is_derived_from` / `get_derived_classes` / `get_all_derived_classes` / `get_overridden_method` /
+`get_overrider_methods`）。
+
 
 ## 1. 模板信息
 
@@ -428,6 +444,11 @@ struct BaseClass {
 > 虚基与 protected/private 基的 thunk 为 `nullptr`，`get_offset()` 返回 `None`。
 > 测试用「常量偏移 == `cast_to` 的实际地址差」做两路一致性校验（含虚基 `None` 的对照）。
 
+> **`BaseClass{}`（默认构造）不是空句柄**：`BaseClass` 是聚合值（`type` / `modifiers` /
+> `cast` / `offset`），不是指向描述表的句柄，因此没有「读空句柄 → `panic`」的约定。
+> `offset` thunk 为 `nullptr` 时 `get_offset()` 就返回 `None`，`type` 也是 `nullptr`。
+> 要表达「没有这条基类关系」请用 `get_bases()` 的 span，不要用默认构造的 `BaseClass`。
+
 > **spike S8.10 结论（GCC 16.2，`-O2` 汇编核对）**
 > - 非虚基 thunk 编译成 `leaq 4(%rcx), %rax`（一条 `lea` + 空指针保护），偏移是立即数；
 >   `main` 里三处偏移直接折成 `$4` / `$8` / `$16` 常量。
@@ -772,18 +793,34 @@ class Method / Function {
 public:
     // 结果直接构造进调用方存储；dst 必须按返回类型的 size/alignment 对齐
     // 返回 void → 不写 dst，只返回状态
-    Status invoke_into(void* dst, ObjectRef self, Args args = {}) const;
-    Status invoke_into(Object& dst, ObjectRef self, Args args = {}) const;  // dst 类型必须匹配
+    Status invoke_into(void* dst, ObjectRef self, Args args = {}) const;   // Function 没有 self
+    Status invoke_into(Object& dst, ObjectRef self, Args args = {}) const; // dst 类型必须匹配
 };
 ```
 
-描述层新增 `InvokeIntoFn`（`self, args, dst`），物化时生成；`invoke` 变成
+描述层新增 `InvokeIntoFn`（`dst, self, args`），物化时生成；`invoke` 变成
 「allocate + `invoke_into` + 按 dtor thunk 收尾」的薄包装。
+
+落地细节：
+
+- `Method::invoke` / `Function::invoke` 对**非引用返回**走 `boxed_allocate + invoke_into
+  + boxed_release`；`boxed_allocate` / `boxed_release` 是返回类型描述符里的成对 thunk
+  （全局 aligned new/delete），所以 `invoke` 不再需要每个方法一份 boxing thunk。
+- **引用返回**仍走旧的 boxing thunk（`invoke` 的语义是拷贝 referent）；`invoke_into`
+  对引用返回直接 `NotSupported`，指向 `invoke_ref`。
+- `&&` 限定方法没有 `invoke_into`（接收者在这一层是左值）：返回 `NotSupported`，
+  指向 `invoke_rvalue`。
+- `Object&` 重载把结果就地写进已有 Object（不替换存储、不重新分配）；void 返回、
+  空 `dst` 是 `InvalidArgument`，类型不符是 `TypeMismatch`。
 
 ### 11.3 边界
 
-- `dst` 对齐/容量不足是前置条件错误 → `panic`（不是可恢复错误）。
+- `dst` 对齐/容量不足是前置条件错误 → `panic`（不是可恢复错误）。实现里检查
+  `dst != nullptr` 与 `dst % alignment == 0`；容量无法在运行期检查，写小了是 UB。
 - 返回值是引用时 `invoke_into` 不做拷贝，返回 `NotSupported`（用 `invoke_ref`）。
+- 返回 `void` 时 `dst` 被忽略（可以传 `nullptr`）；`Object&` 重载对 void 返回
+  `InvalidArgument`。
+- 默认分配器拒绝分配时，`invoke` 返回 `NotSupported`（不静默回退到全局 `new`）。
 
 ## 12. 分配策略
 
@@ -793,15 +830,15 @@ public:
 class Allocator {
 public:
     virtual ~Allocator() = default;
-    virtual void* allocate(std::size_t size, std::size_t alignment) = 0;
-    virtual void deallocate(void* block) noexcept = 0;
+    virtual void* allocate(std::size_t size, std::size_t alignment) = 0;  // nullptr = 失败
+    virtual void deallocate(void* block) noexcept = 0;                    // arena 可为空操作
 };
 
 class Object {
 public:
     // 线程局部的默认分配器；nullptr → ::operator new / ::operator delete
-    static void set_default_allocator(Allocator* allocator);
-    static Allocator* get_default_allocator();
+    static void set_default_allocator(Allocator* allocator) noexcept;
+    static Allocator* get_default_allocator() noexcept;
 };
 
 class Class {
@@ -809,14 +846,30 @@ public:
     Outcome<Object> new_instance_with(Allocator& allocator, Args args = {}) const;
     Outcome<Object> new_aggregate_with(Allocator& allocator, Args args = {}) const;
 };
+
+class ArenaAllocator final : public Allocator {   // 参考实现
+public:
+    explicit ArenaAllocator(std::size_t chunk_size = 64 * 1024) noexcept;
+    void reset() noexcept;                        // 整块释放，可继续使用
+    std::size_t get_chunk_count() const noexcept; // 诊断 / 测试
+};
 ```
 
 ### 12.2 设计取舍
 
-- `Object` 头里只存「释放函数指针 + 分配块指针」，**不存 Allocator 指针**（省 8 字节）：
-  释放走生成它的分配路径留下的 deallocate thunk。
-- 默认路径零开销：不设置分配器时，thunk 就是 `::operator delete` 的包装。
-- 提供 `speculo::ArenaAllocator` 参考实现（单调递增 + 整体释放），用于一次反射批处理。
+- 分配器路径在值前面放一个 `AllocationHeader { Allocator*, 块指针, DestroyFn }`，
+  值按 `alignment` 对齐到 header 之后。`Object` 从 16 字节变成 24 字节：两个数据指针
+  加一个 per-object release thunk，**不存** Allocator 指针（释放靠 header 找回）。
+- 默认路径零开销：不设置分配器时，存放的不是 `::operator delete` 的包装，而是
+  `Object::reset()` 走描述符的 `release`（`delete`），因为 `m_release == nullptr`；
+  只有分配器 / `boxed_allocate` 路径才写 per-object release。
+- 设置了默认分配器后，`Object::from_value` / `Object::make` / `Class::new_instance` /
+  `new_aggregate` / `Method::invoke` / `Function::invoke` 全部走它；它拒绝分配时返回
+  `NotSupported`，**不**静默回退到全局 `new`。仍走描述符自带 `new` 的装箱：
+  `Object::clone`、`Field::get`、`Annotation::value`、`Callable::invoke`（这些 thunk
+  直接返回堆块，v2 没有为它们生成「构造进 dst」的版本）。
+- `new_instance_with` / `new_aggregate_with` 只认传入的分配器，不看线程局部默认值；
+  因此可以嵌套使用（例如 arena 里的对象再指定另一个分配器）。
 - **SSO 不做**。`Object` 内联存储需要 move thunk + 尺寸上限 + 「是否已内联」标志，
   复杂度高、收益有争议；v2 用分配器解决，取舍记入 design.md。
 
@@ -847,8 +900,19 @@ public:
 里得到同一个 id。这是「跨 DSO 做键」的推荐方式：`operator==` 最坏退化为字符串比较，
 `get_type_id()` 恒为整数比较。
 
-**已知限制**（文档必须写死）：身份统一 ≠ thunk 通用。A 库物化出的 `Field` 作用在
-B 库构造的对象上，依赖两边布局与调用约定一致；跨编译器 / 跨 ABI 版本不保证。
+落地细则：
+
+- id = `fnv1a64(normalized_name)`；若该槽位已被**另一个**名字占用，就线性向后探测
+  （冲突链）。64 位真碰撞时两个名字仍得到不同 id，但谁拿基址取决于先注册的顺序——
+  这是已写死的限制，概率可忽略。
+- 没有规范名的类型（匿名命名空间、函数局部、`Array::new_instance` 的动态数组视图）
+  不进入 id 表：id 取 `fnv1a64(qualified_name)`，进程内稳定，但两份匿名副本可能同 id。
+  它们之间的 `operator==` 只在描述符指针相同时为真。
+- 空句柄的 `get_type_id()` 返回 0（`Class{} == Class{}`，两者必须同 hash）。
+- `std::hash<speculo::Class>` 特化返回 `get_type_id()`，与放宽后的 `operator==` 保持
+  「相等 ⇒ 同 hash」。旧代码若把 `Class` 当地址键用，需要改成 id。
+- **已知限制**（文档必须写死）：身份统一 ≠ thunk 通用。A 库物化出的 `Field` 作用在
+  B 库构造的对象上，依赖两边布局与调用约定一致；跨编译器 / 跨 ABI 版本不保证。
 
 ## 14. `std` 深物化白名单
 
@@ -869,6 +933,10 @@ SPECULO_DEEP(std::string);
   物化；不传播到成员类型（`std::vector<int>` 的元素类型仍是浅的，除非也标注）。
 - 重复标注幂等；`SPECULO_DEEP` 与 `class_of<T>()` 首次调用都可作为激活点。
 - 代价可观测：`get_size()` 不变，成员表变大；编译期爆炸由 design §17 的成员上限诊断兜底。
+- **可见性要求（实现限制）**：宏展开为该类型的变量模板显式特化。它必须出现在
+  **每个会物化该类型的翻译单元**里；只在一个 TU 标注、另一个 TU 也调用
+  `class_of<T>()`，会让两个 TU 实例化出内容不同的 `bundle<T>`（ODR 违规，链接器只留
+  一份）。同一 TU 内重复标注是重定义错误（宏不提供幂等展开）。
 
 ## 15. 关系图：继承与虚函数覆盖
 
@@ -877,32 +945,61 @@ SPECULO_DEEP(std::string);
 ```cpp
 class Class {
 public:
-    // 注册表里有记录的直接派生类 / 全部后代（顺序不保证，按注册顺序）
+    // 注册表里有记录的直接派生类 / 全部后代（顺序：注册顺序，逐层）
     std::vector<const Class*> get_derived_classes() const;
     std::vector<const Class*> get_all_derived_classes() const;
 
-    bool is_derived_from(const Class& base) const;        // 传递闭包，仅 public 路径
-    Result<std::vector<const Class*>, Error> get_conversion_path(const Class& base) const;
-        // 向上多跳路径（含 identity）；0 条 → TypeMismatch，>1 条 → Ambiguous
+    bool is_derived_from(const Class& base) const;   // 传递闭包，仅 public 路径，不含自身
+    Outcome<std::vector<const Class*>> get_conversion_path(const Class& base) const;
+        // 向上多跳路径（含 identity）；错误口径见 §15.2
 };
 
 class Method {
 public:
-    Option<Method> get_overridden_method() const;      // 沿基类链找同名、同形参退化类型、同 cv
+    Option<Method> get_overridden_method() const;      // 沿基类链找最近的一个虚函数覆盖
     std::vector<Method> get_overrider_methods() const; // 注册表内所有覆盖它的方法
-    Option<std::size_t> get_vtable_index() const;      // ⚠️ 待 spike，可能恒为 None
 };
 ```
+
+`get_vtable_index()` **不在 v2**：GCC 16.2 的 `<meta>` 只有 `is_virtual` / `is_pure_virtual` /
+`is_override`，没有任何槽位号能力（spike `spikes/s13_graph.cpp` 复核），拿到真实槽号必须依赖
+Itanium ABI 的私有布局。见 §17「v2 明确不做」。
 
 ### 15.2 规则
 
 - **派生查询只覆盖已注册类型**：`class_of<T>()` 调用过或 `SPECULO_REGISTER` 标注过的。
-  文档必须显著写死，否则用户会以为本库是全知的。
-- 注册表 v2 增加**反向边索引**（base → derived），插入时维护，查询 O(1) 取列表。
-- `is_derived_from` 只沿 public 基路径（与 `cast_to` 无 RTTI 的取舍一致）。
-- `get_overridden_method` 的匹配口径：名字 + 形参**退化**类型序列 + `const` 限定；
-  协变返回不算覆盖（判定需要向上转换，留作 v3）。
-- `get_overrider_methods` 同样受注册范围限制。
+  文档必须显著写死，否则用户会以为本库是全知的。这条限制同时适用于 `get_derived_classes` /
+  `get_all_derived_classes` / `get_overrider_methods`。
+- 注册表 v2 增加**反向边索引**（base → derived），插入时维护，查询 O(1) 取列表。索引键是
+  **基类的 `normalized_name`**，不是描述符指针——这样它和 `Class::operator==` 的第二条分支
+  （跨 DSO 同名即同类）口径一致。边只在某个类**首次**注册时建立，重复注册不会重复插边。
+- `is_derived_from` 只沿 public 基路径（与 `cast_to` 无 RTTI 的取舍一致），且**不含自身**：
+  `D.is_derived_from(D)` 为 false，身份判断用 `==`。它等价于 `base.is_assignable_from(D)`。
+- `get_conversion_path(base)` 的错误口径与 `cast_to` 完全对齐：没有任何路径 → `TypeMismatch`；
+  只有 protected / private 路径 → `NotSupported`；多个**不同子对象**可达 → `Ambiguous`。
+  两条落在同一个**虚基**子对象上的路径算一条（虚基在整个对象里唯一，这正是 `cast_to` 比较地址
+  所表达的同一件事，这里是静态判定），所以虚继承菱形返回路径而不是 `Ambiguous`。合并后取**最短**
+  的一条；等长时取 `get_bases()` 声明顺序里的第一条（即 DFS 找到的第一个），因此结果稳定可断言。
+  结果的每个元素都是 `class_of<T>()` 的规范句柄，不指向调用者的临时对象。
+- `get_overridden_method` 的匹配口径是 **C++ 的覆盖规则**：名字 + 形参类型序列（**精确**，
+  不是退化后的）+ `const` / `volatile` / ref-qualifier 全同；基类那一侧必须是 `virtual`，
+  自身也必须是 `virtual`。因此 `void f(int)` 不会与 `void f(const int&)` 配对，`const` /
+  非 `const` 也不会——用退化序列会把这两类「隐藏」误判成覆盖。协变返回不算覆盖
+  （判定需要向上转换，留作 v3）。搜索沿基类链**广度优先**，返回最近的一层声明。
+- `get_overrider_methods` 同样受注册范围限制，且要求候选方法本身也是 `virtual`；继承路径
+  不限 public（私有 / 保护继承照样能覆盖）。
+- 空句柄是**前置条件违反**：`is_derived_from` / `get_conversion_path` 的任一侧是默认构造的
+  `Class{}` 时 `panic`，不返回 `false` / `Err`（与其它「读空句柄」一致）。
+
+### 15.3 检查顺序（测试矩阵的期望值来源）
+
+| API | 检查顺序 |
+|---|---|
+| `Class::get_conversion_path(base)` | 两侧句柄非空（空 → `panic`）→ 沿 public 边收集路径（0 条：完全无关 → `TypeMismatch`，仅 protected/private → `NotSupported`）→ 不同子对象多于一条 → `Ambiguous` |
+| `Class::is_derived_from(base)` | 两侧句柄非空（空 → `panic`）→ `*this == base` 为真 → `false` → 沿 public 边做传递闭包 |
+| `Class::get_derived_classes` / `get_all_derived_classes` | 无错误分支：句柄为空 → `panic`；未注册 → 空列表 |
+| `Method::get_overridden_method` | 自身非 `virtual` → `None` → 广度优先遍历基类链，首个匹配 → `Some`；无匹配 → `None` |
+| `Method::get_overrider_methods` | 自身非 `virtual` → 空 → 扫已注册类（跳过自身声明类、非派生类、非虚方法） |
 
 ## 16. 诊断
 
@@ -919,12 +1016,31 @@ std::string to_string(ObjectRef value);   // 逐字段格式化；不可格式�
 一律委托给上述函数。格式化走 `requires { std::formatter<T>{}; }` 检测，不引入异常；
 `Object` 为空 → `"<null>"`。
 
+落地格式（快照测试按此断言）：
+
+- `describe()`：`限定名`，换行后 `  kind: class`、可选 `  normalized: ...`、
+  `  size: N byte(s), alignment: M`、`  modifiers: ...`、`  fields:`（每个 public
+  字段一行 `类型 名字 @ 偏移`，静态字段也列在 describe 里；没有时 ` (none)`）、
+  `  methods:`（每个 public 方法一行完整签名；没有时 ` (none)`）。
+- `to_string(ObjectRef)`：`类型 { 字段 = 值, ... }`；值为空（null view）→ `"<null>"`；
+  volatile view → `"<volatile>"`（诊断路径不做隐式去 volatile 读取）；静态字段跳过；
+  不可格式化的字段写 `"<unprintable>"`。
+- 字段格式化能力在物化时按 `std::formattable<F, char>` 判一次，存进 `FieldDesc::format`
+  thunk（`std::string (*)(const void*)`）。引用 / 位域 / 静态字段都可用，数组与 volatile
+  字段标记为不可格式化。
+- `formatter<Class>` = `describe()`；`formatter<Field>` = `"限定名.字段名"`；
+  `formatter<Object>` = `to_string(obj.cref())`（空 Object → `"<null>"`）。
+- `describe()` 只列 public 成员；需要 private/protected 的用 `get_declared_*`。
+
 ## 17. v2 明确不做
 
 1. 成员函数模板、类模板的按名实例化（§1.3）。
 2. 命名空间枚举、命名空间作用域变量（除静态成员地址，§9）。
-3. 协变返回的覆盖判定、真实的 vtable slot 编号（§15.2）。
-4. 向下 / 交叉转换（仍需 RTTI）。
-5. 跨 DSO 的 thunk 互换（§13.3 限制）。
-6. `Object` 的 SSO（§12.2）。
-7. 注解驱动的成员注入、条件注解（P3394 §4.5 未进 C++26，v1 已排除，v2 不变）。
+3. 协变返回的覆盖判定（§15.2）。
+4. `Method::get_vtable_index()`：GCC 16.2 的 `<meta>` 只给 `is_virtual` / `is_pure_virtual` /
+   `is_override`，没有槽位号（spike `spikes/s13_graph.cpp`）；真槽号要读 Itanium ABI 的私有
+   vtable 布局，与「无 RTTI、不依赖 ABI 私有细节」的定位冲突，因此 v2 不提供该 API。
+5. 向下 / 交叉转换（仍需 RTTI）。
+6. 跨 DSO 的 thunk 互换（§13.3 限制）。
+7. `Object` 的 SSO（§12.2）。
+8. 注解驱动的成员注入、条件注解（P3394 §4.5 未进 C++26，v1 已排除，v2 不变）。

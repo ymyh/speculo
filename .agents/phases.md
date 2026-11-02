@@ -14,16 +14,18 @@
 `Enumerator` / `BaseClass` / `Array` / `Modifier`、双视图成员访问、三级查找、继承与 `cast_to`、
 注册表与 `SPECULO_IMPL` 家族。CMake 与 xmake 双系统全绿。
 
-**测试现状**：324 个用例（CMake 全绿，`ctest` 6/6；xmake 同样 6/6）。v1 的测试已按
+**测试现状**：388 个用例（CMake 全绿，`ctest` 7/7；xmake 同样 7/7）。v1 的测试已按
 @.agents/testing.md §2–§5 对齐，**7 张组合矩阵**覆盖 `Method::invoke`（5 × 5）、`Field::set`
 （5 × 5）、`Class::get_method`（5 × 4）、`Constructor::new_instance`（5 × 5）、`Array` 操作
 （5 × 4 + Option 列）、`cast_to`（5 × 2）、枚举三向互转（4 × 6），`Function` 侧的 6 张沿用；
 Phase 9 又加了 `Callable::invoke` 的接收者 × 实参表，Phase 10 加了值类别 / `Class::assign` /
 `invoke_with_defaults` / 存储期四张表，Phase 11 加了编译期遍历的对象形态 × 回调形态、
-成员形态 × 回调形态、字段表列 × 类型形态、两路计数一致性四张表。错误优先级（api_design §0.1）由矩阵中
-「同时两个错」的格子钉住。前 3 张的期望值由 `tools/gen_matrix.py` 枚举生成，其余按行内
-数据表。9 个句柄各自的「空句柄 → `panic`」死亡用例也已补齐（共 15 个 `EXPECT_DEATH`，
-约占 9 s 跑时，属预期开销）。
+成员形态 × 回调形态、字段表列 × 类型形态、两路计数一致性四张表，Phase 12 加了
+`invoke_into` / `new_instance_with` / 分配器 / 类型身份四张表，Phase 13 加了关系图的两张
+（`get_conversion_path` 的接收者 × 目标、覆盖查询的方法形态 × 查询）。错误优先级
+（api_design §0.1）由矩阵中「同时两个错」的格子钉住。前 3 张的期望值由
+`tools/gen_matrix.py` 枚举生成，其余按行内数据表。9 个句柄各自的「空句柄 → `panic`」死亡
+用例也已补齐（共 27 个 `EXPECT_DEATH`，是整套跑时的主要来源，属预期开销）。
 
 **工具链（硬约束，v2 不变）**
 
@@ -180,43 +182,62 @@ Phase 9 又加了 `Callable::invoke` 的接收者 × 实参表，Phase 10 加了
 **验收**：`for_each_field` 在用户 TU 可用；`field_table<T>` 为 `constexpr` 且可作偏移索引；
 运行期 `get_fields()` 与编译期 `for_each_field` 的字段集合/顺序完全一致（同一收集器）。
 
-## Phase 12：工程化（4~5 天）
+## Phase 12：工程化（4~5 天）—— ✅ 已完成（2026-11-02）
 
 目标：让它能进真实项目——不分配、可分配、跨库认得出、可诊断。对应 api_design §11–§14、§16。
 
-- [ ] `InvokeIntoFn` + `Method::invoke_into` / `Function::invoke_into`；
-  `invoke` 改为 `allocate + invoke_into + dtor` 的薄包装
-- [ ] `Allocator` + `Object::set_default_allocator` / `get_default_allocator`；
+> 落地记录与实现偏差见 `review.md`「Phase 12」。与下文清单的差异：
+> `Method::invoke_into` 只覆盖左值接收者（没有 `invoke_rvalue_into`，`&&` 方法返回
+> `NotSupported`）；`invoke` 对**非引用返回**改为 `boxed_allocate + invoke_into + dtor`，
+> 引用返回仍用旧 boxing thunk。`Object` 因 per-object release 从 16 字节变成 24 字节。
+> `SPECULO_DEEP` 的变量模板特化有可见性要求（见 api_design §14），同一 TU 重复标注是
+> 重定义错误，不是幂等。`describe()` 只列 public 成员；`formatter<Field>` 输出
+> `"限定名.字段名"`。
+
+- [x] `InvokeIntoFn` + `Method::invoke_into` / `Function::invoke_into`（`void*` 与 `Object&`
+  两个重载）；`invoke` 改为 `allocate + invoke_into + dtor` 的薄包装
+- [x] `Allocator` + `Object::set_default_allocator` / `get_default_allocator`；
   `Class::new_instance_with` / `new_aggregate_with`；`ArenaAllocator` 参考实现
-- [ ] 类型身份：`Class::operator==` 三分支（指针 → 规范名 → false）+ `get_type_id`
+- [x] 类型身份：`Class::operator==` 三分支（指针 → 规范名 → false）+ `get_type_id`
   （FNV-1a + 冲突链）；`Class` 的 `std::hash` 特化指向 `get_type_id`
-- [ ] `SPECULO_DEEP(Type)` + `detail::deep_materialize<T>()`（只影响该特化，不传播）
-- [ ] 诊断：`Class::describe` / `to_string(ObjectRef)` + `std::formatter<Class/Field/Object>`
-- [ ] 编译期护栏：成员数 / 模板实参数超阈值 → `static_assert`，消息带类型名与处置建议
-- [ ] 测试：`tests/invoke_into_test.cpp` / `allocator_test.cpp` / `type_identity_test.cpp` 扩展 /
+- [x] `SPECULO_DEEP(Type)` + `detail::deep_materialize<T>()`（只影响该特化，不传播）
+- [x] 诊断：`Class::describe` / `to_string(ObjectRef)` + `std::formatter<Class/Field/Object>`
+- [x] 编译期护栏：成员数 / 模板实参数超阈值 → `static_assert`，消息带类型名与处置建议
+- [x] 测试：`tests/invoke_into_test.cpp` / `allocator_test.cpp` / `type_identity_test.cpp` 扩展 /
   `deep_std_test.cpp` / `diagnostics_test.cpp`
 
 **验收**：proxy 风格的热路径调用零分配（以计数分配器验证）；同一类型在「两份静态副本」下
 `operator==` 为真且 `get_type_id()` 相同；`SPECULO_DEEP(std::vector<int>)` 后能列出其方法；
 `describe()` 输出稳定（快照测试）。
 
-## Phase 13：关系图与收尾（3~4 天）
+## Phase 13：关系图与收尾（3~4 天）—— ✅ 已完成（2026-11-02）
 
 目标：继承/重写的关系图，加上 v1 遗留小项与文档终审。对应 api_design §15。
 
-- [ ] 注册表 v2：反向边索引（base → derived），插入时维护
-- [ ] `Class::get_derived_classes` / `get_all_derived_classes` / `is_derived_from` /
-  `get_conversion_path`（0 条 → `TypeMismatch`，>1 条 → `Ambiguous`）
-- [ ] `Method::get_overridden_method` / `get_overrider_methods`；`get_vtable_index`
-  （S8.7 若不可得则恒 `None`，文档写明）
-- [ ] tests：`tests/type_graph_test.cpp`（含「未注册派生类不可见」的负面用例）
-- [ ] **v1 遗留小项**（不阻塞 v2，但顺手清）：
-  - 删除 `speculo::version_string()` 占位
-  - `get_qualified_name()` 对 `{aka ...}` 别名的显示问题（`normalized_name` 已有，检查 `for_name` 两条键是否覆盖全部情况）
-  - 私有/保护构造函数仍不可 `new_instance`（命名空间作用域 `new` 无类内访问权，已知限制，文档写死）
-  - `Array::new_instance` 不支持「元素本身是数组」（`int[3][]`）
-- [ ] 文档终审：design.md / api_design.md / phases.md 与实现逐条对齐；`review.md` 补「Phase 8–13」
-- [ ] `examples/proxy_demo.cpp`（Microsoft proxy 集成）+ `SECONDARY` 示例更新
+> 落地记录与 7 条实现偏差见 `review.md`「Phase 13」。与下文清单的不同：
+> `Method::get_vtable_index` **没有实现**（GCC 16.2 无任何槽位号能力，整条移入 api_design §17）；
+> `get_conversion_path` 的错误口径与 `cast_to` 对齐（仅 protected/private 路径 → `NotSupported`，
+> 不是 `TypeMismatch`）；`is_derived_from` **不含自身**；覆盖匹配用**精确**形参类型（退化序列会把
+> `void f(int)` 与 `void f(const int&)` 误判成覆盖）；反向边索引键是 `normalized_name` 而非描述符指针；
+> `version_string()` 改名为 `version()`，值由 `SPECULO_VERSION` 宏给出（CMake / xmake 各自定义）。
+
+- [x] 注册表 v2：反向边索引（base → derived）+ 全部已注册类的清单，插入时维护
+- [x] `Class::get_derived_classes` / `get_all_derived_classes` / `is_derived_from` /
+  `get_conversion_path`（0 条 → `TypeMismatch`，仅 protected/private → `NotSupported`，>1 条 → `Ambiguous`）
+- [x] `Method::get_overridden_method` / `get_overrider_methods`（`get_vtable_index` 移入 §17）
+- [x] tests：`tests/type_graph_test.cpp`（16 个用例 / 4 张矩阵，含「未注册派生类不可见」的负面用例与空句柄 panic）
+- [x] **v1 遗留小项**（不阻塞 v2，但顺手清）：
+  - `version_string()` → `version()`，版本号由构建系统以 `SPECULO_VERSION` 传入（见 `src/mod.cppm`）
+  - `get_qualified_name()` 的 `{aka ...}` 问题：复核结论是 GCC 16.2 的类型 display string **不产生**
+    `{aka ...}`（只出现在诊断文本里），`normalize_type_name` 的剥离是防御性的，`registry_test.cpp`
+    已把「带 `{aka}` 的查询名归一化」钉住，无需改实现
+  - 私有/保护构造函数仍不可 `new_instance`：命名空间作用域 `new` 无类内访问权，**已在
+    @.agents/design.md §11 与 `README.md`「Limits」写死**为已知限制
+  - `Array::new_instance` 不支持「元素本身是数组」（`int[3][]`）：记为**已知限制**
+    （@.agents/design.md §11 + `README.md`「Limits」）
+- [x] 文档终审：design.md / api_design.md / phases.md 与实现逐条对齐；`review.md` 补「Phase 8–13」
+- [x] `examples/06_proxy_demo.cpp`（[ngcpp/proxy](https://github.com/ngcpp/proxy) 4.1.0 集成，
+  构建系统双份依赖声明；原清单里的 `SECONDARY` 是遗留笔误，已删除）
 
 **验收**：双构建系统全绿；`get_derived_classes` 在「注册 3 层继承」的用例上结果正确；
 文档中不存在与实现不符的段落（逐节核对）。
@@ -249,5 +270,6 @@ Phase 8 (spike) ──> Phase 9 (类型建模) ──┬──> Phase 10 (操作
 
 ## 不在计划内
 
-v2 明确不做的 7 项（成员函数模板按名实例化、命名空间枚举、协变返回覆盖、向下转换、
-跨 DSO thunk 互换、`Object` 的 SSO、注解注入成员）见 @.agents/api_design.md §17。
+v2 明确不做的 8 项（成员函数模板按名实例化、命名空间枚举、协变返回覆盖、
+`Method::get_vtable_index`、向下转换、跨 DSO thunk 互换、`Object` 的 SSO、
+注解注入成员）见 @.agents/api_design.md §17。

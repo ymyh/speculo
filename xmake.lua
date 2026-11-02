@@ -73,17 +73,44 @@ package("crab_cpp")
 
 package_end()
 
+-- proxy (https://github.com/ngcpp/proxy): header-only, used by the proxy
+-- integration example only. Not in xmake-repo, so it is declared here the same
+-- way crab_cpp is.
+package("ngproxy")
+
+    set_kind("library", {headeronly = true})
+    set_homepage("https://github.com/ngcpp/proxy")
+    set_description("Proxy: Next Generation Polymorphism in C++ (community fork)")
+    set_license("MIT")
+    add_urls("https://github.com/ngcpp/proxy/archive/refs/tags/$(version).tar.gz")
+    add_urls("https://github.com/ngcpp/proxy.git", {alias = "git"})
+    add_versions("4.1.0", "f46fd0fbcaf461f4904f35416edf94abc62d5582b66d6e769e676fd7bd478311")
+    add_versions("git:4.1.0", "4.1.0")
+
+    on_install(function (package)
+        os.cp("include", package:installdir())
+    end)
+
+package_end()
+
 add_requires("crab_cpp")
+add_requires("ngproxy")
 add_requires("gtest", {configs = {main = true}})
 
 -- speculo only targets GCC >= 16. `-freflection` enables P2996; `-fno-rtti`
 -- and `-fno-exceptions` ban RTTI and exception throwing project-wide (errors go
 -- through crab_cpp Option/Result). `force` is needed because xmake's flag probe
 -- does not recognise the experimental `-freflection` option.
+--
+-- SPECULO_VERSION is what speculo::version() reports (src/mod.cppm); keep it in
+-- sync with project(... VERSION ...) in CMakeLists.txt.
+local _speculo_version = "0.1.0"
+
 local function _add_speculo_flags(target)
     if target:has_tool("cc", "gcc") then
         target:add("cxflags", "-freflection", "-fno-rtti", "-fno-exceptions", {force = true})
     end
+    target:add("defines", 'SPECULO_VERSION="' .. _speculo_version .. '"')
 end
 
 target("speculo")
@@ -131,7 +158,9 @@ target("speculo_test")
 -- `moduleonly` and is not linked/build on its own).
 for _, example_src in ipairs(os.files("examples/*.cpp")) do
 
-    target("example_" .. path.basename(example_src))
+    local example_name = path.basename(example_src)
+
+    target("example_" .. example_name)
 
         set_enabled(has_config("enable-example"))
         set_kind("binary")
@@ -141,6 +170,11 @@ for _, example_src in ipairs(os.files("examples/*.cpp")) do
         add_packages("crab_cpp")
         add_files("src/*.cppm", example_src)
         add_includedirs("include")
+
+        -- The proxy integration example is the only one with an extra dependency.
+        if example_name == "06_proxy_demo" then
+            add_packages("ngproxy")
+        end
 
         on_config(function (target)
             _add_speculo_flags(target)

@@ -197,6 +197,31 @@ static_assert(offsets[0].offset == 0);
 
 It sees the same public members, in the same order, as `get_fields()` / `get_methods()`: non-static fields first, then static fields; public only; no base expansion; `std` types stay shallow. Static fields have offset 0 and `is_static == true` in the table. Bit-fields arrive by value (there is no reference), so callbacks that must work for every field take `const auto&` or `auto&&`; plain fields are passed as lvalues and can be modified through `auto&`.
 
+## Type graph
+
+`Class` can walk the inheritance graph in both directions, and `Method` can find what it overrides.
+
+```cpp
+speculo::class_of<Circle>().get_derived_classes();       // direct registered children
+speculo::class_of<Shape>().get_all_derived_classes();    // all registered descendants
+speculo::class_of<Circle>().is_derived_from(speculo::class_of<Shape>());   // true
+
+speculo::class_of<Circle>().get_conversion_path(speculo::class_of<Shape>()).unwrap();
+// { Circle, Shape }: every hop is a public base edge.
+```
+
+`get_conversion_path` reports `TypeMismatch` when the target is not a base at all, `NotSupported` when it is one only through protected or private inheritance, and `Ambiguous` when several distinct subobjects are reachable. Two paths into the same *virtual* base count as one, so a virtual diamond resolves. The same rules apply to `cast_to`, which takes an object instead of a type.
+
+```cpp
+speculo::Method area = speculo::class_of<Ball>().get_method("area").unwrap();
+area.get_overridden_method().unwrap().get_declaring_class();   // Circle
+speculo::class_of<Shape>().get_method("area").unwrap().get_overrider_methods();   // { Circle::area, Ball::area }
+```
+
+An override is matched by the C++ rule: same name, same parameter types (exactly, not after decay), same cv and ref qualification, and the base declaration must be `virtual`. Covariant returns are not matched.
+
+**Derived queries only see registered types.** A class enters the table when `class_of<T>()` is first called for it, or when `SPECULO_REGISTER` runs. Speculo cannot enumerate types it has never materialized, so a derived class nobody asked about does not appear in `get_derived_classes()`. This is the one place where the library is not all-knowing, and it is the price of having no RTTI.
+
 ## Limits
 
 - Templates are not reflected, only concrete types. A `using` alias is the type it names; annotations on the alias are not visible.
@@ -204,6 +229,10 @@ It sees the same public members, in the same order, as `get_fields()` / `get_met
 - Bit-fields can be read and written. `get_ref` returns `NotSupported` because a bit-field has no address.
 - Reflecting a class materializes every reflectable member, and the types those members mention. A class whose member function is ill-formed to instantiate cannot be materialized. Reflect your own types; `class_of` on a library class template specialization can fail for that reason.
 - The project builds with `-fno-exceptions`. A reflected function that throws has undefined behavior.
+- Derived-class and overrider queries cover registered types only (see [Type graph](#type-graph)).
+- A private or protected constructor is listed by `get_declared_constructors()` but cannot be called: `new_instance` / `construct_at` return `NotSupported`, because construction happens at namespace scope, where class access does not apply. Expose a public factory function and use `function_of` instead.
+- `Array::new_instance` refuses an array element type (`int[3]`): the element has to be default-constructible, destructible and an object type. Use a one-dimensional dynamic array and index it yourself.
+- There is no `get_vtable_index()`: GCC 16.2's `<meta>` reports `is_virtual` / `is_pure_virtual` / `is_override` but no slot number, and a real slot number would require the Itanium ABI's private vtable layout.
 
 ## Examples
 
@@ -214,5 +243,6 @@ It sees the same public members, in the same order, as `get_fields()` / `get_met
 | `examples/03_inheritance_enum_array.cpp` | Bases, enumerators, arrays |
 | `examples/04_registry_and_macros.cpp` | `for_name`, `SPECULO_REGISTER`, `SPECULO_IMPL` |
 | `examples/05_compile_time.cpp` | `for_each_field` / `for_each_member`, `field_table`, generated `to_json` and hashing |
+| `examples/06_proxy_demo.cpp` | [proxy](https://github.com/ngcpp/proxy) integration: type-erased slots, runtime `Class` via `SPECULO_IMPL_VIRTUAL`, reflection on an untyped slot |
 
-`speculo::version_string()` returns `"0.1.0"`.
+`speculo::version()` returns the version the module was built as (`"0.1.0"`): the build system passes it as `SPECULO_VERSION` when compiling the module units.

@@ -10,6 +10,8 @@
 // ────────────────────────────────────────────────────────────────
 // SPECULO_IMPL(Type)          —— 非虚版本（默认，零开销）
 // SPECULO_IMPL_VIRTUAL(Type)  —— 虚函数版本（多态/proxy 场景）
+// SPECULO_REGISTER(Type)      —— 强制按名字注册
+// SPECULO_DEEP(Type)          —— 让一个 std 特化按用户类型的规则物化
 //
 // 两者都在类定义内部（public 区）使用，注入成员函数 get_class()：
 //
@@ -93,5 +95,33 @@
     [[maybe_unused]] static const bool                                  \
         SPECULO_DETAIL_CAT(speculo_registered_, __COUNTER__) =          \
             (::speculo::register_class(::speculo::class_of<Type>()), true)
+
+// ────────────────────────────────────────────────────────────────
+// SPECULO_DEEP(Type)          —— 让一个 std 特化按用户类型的规则物化
+//
+// 默认情况下命名空间 std 里的类型只做浅物化（名字/尺寸/拷贝析构等 Object
+// 所需的值操作），成员表是空的——否则一个 std::string 字段就会把整棵
+// basic_string 的签名闭包编进来。SPECULO_DEEP 显式放开**该特化自身**：
+//
+//     SPECULO_DEEP(std::vector<int>);
+//     speculo::class_of<std::vector<int>>().get_methods();   // 非空
+//
+// 规则（api_design §14）：
+//   - 只影响标注的类型，不传播：vector<int> 的元素 int 仍是普通类型；若
+//     元素本身也是 std 类型且需要展开，单独再标一次。
+//   - 必须在首次物化该类型之前出现（同一翻译单元内的显式特化不能晚于
+//     首次使用）；不同翻译单元里的相同标注可以并存。
+//   - 同一翻译单元内重复标注同一类型是重定义错误（宏不提供幂等展开）。
+//   - 代价可观测：get_size() 不变，成员表变大；成员数超限由编译期护栏报错。
+//
+// 展开为一个变量模板显式特化 + 一个静态初始化器（强制发出描述表）。注意
+// 它和 SPECULO_REGISTER 一样是命名空间作用域宏。
+
+#define SPECULO_DEEP(Type)                                                       \
+    template<>                                                                   \
+    inline constexpr bool ::speculo::detail::deep_materialized<Type> = true;     \
+    [[maybe_unused]] static const bool                                           \
+        SPECULO_DETAIL_CAT(speculo_deep_, __COUNTER__) =                         \
+            (::speculo::detail::deep_materialize<Type>(), true)
 
 #endif // SPECULO_MACROS_H

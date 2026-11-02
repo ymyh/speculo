@@ -11,7 +11,7 @@ else()
     set(CMAKE_EXPERIMENTAL_CXX_IMPORT_STD "451f2fe2-a8a2-47c3-bc32-94786d8fc91b")
 endif()
 
-project(speculo LANGUAGES CXX)
+project(speculo VERSION 0.1.0 LANGUAGES CXX)
 
 # speculo targets C++26 only; `-freflection` enables the P2996 static
 # reflection subset implemented by GCC 16+.
@@ -88,6 +88,11 @@ target_link_libraries(speculo PUBLIC crab_cpp)
 # throwing project-wide (errors are reported via crab_cpp Option/Result only).
 target_compile_options(speculo PRIVATE -freflection -fno-rtti -fno-exceptions)
 
+# speculo::version() returns this string (see src/mod.cppm). The value comes from
+# project() above so the version is written down once; xmake.lua defines the same
+# macro for its own builds.
+target_compile_definitions(speculo PRIVATE SPECULO_VERSION="${PROJECT_VERSION}")
+
 # Tests
 if (SPECULO_BUILD_TEST)
     enable_testing()
@@ -124,6 +129,17 @@ endif()
 option(SPECULO_BUILD_EXAMPLES "Build speculo examples" ON)
 
 if (SPECULO_BUILD_EXAMPLES)
+    # examples/06_proxy_demo.cpp uses the proxy library (the community-maintained
+    # successor of microsoft/proxy). Header-only, consumed as a subproject.
+    include(FetchContent)
+    FetchContent_Declare(
+        ngproxy
+        GIT_REPOSITORY https://github.com/ngcpp/proxy.git
+        GIT_TAG 4.1.0
+        GIT_SHALLOW TRUE
+    )
+    FetchContent_MakeAvailable(ngproxy)
+
     file(GLOB SPECULO_EXAMPLE_SOURCES examples/*.cpp)
 
     foreach (example_src IN LISTS SPECULO_EXAMPLE_SOURCES)
@@ -134,6 +150,12 @@ if (SPECULO_BUILD_EXAMPLES)
         target_link_libraries("${example_target}" PRIVATE speculo)
         target_include_directories("${example_target}" PRIVATE include)
         target_compile_options("${example_target}" PRIVATE -freflection -fno-rtti -fno-exceptions)
+
+        # proxy 4 defines the interface target `msft_proxy4` (alias
+        # `msft_proxy4::proxy`) with its own include directory.
+        if (example_name STREQUAL "06_proxy_demo")
+            target_link_libraries("${example_target}" PRIVATE msft_proxy4)
+        endif()
 
         if (MINGW)
             target_link_options("${example_target}" PRIVATE "-Wl,--allow-multiple-definition")
