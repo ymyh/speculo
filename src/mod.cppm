@@ -6,9 +6,11 @@ import crab_cpp;
 export import :error;
 export import :modifier;
 export import :descriptor;
+export import :meta;
 export import :object;
 export import :function;
 export import :registry;
+export import :compile;
 
 export namespace speculo
 {

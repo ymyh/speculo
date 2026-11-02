@@ -190,10 +190,9 @@ export import :registry;
 ```
 
 - Module partition names are single lowercase words (`error`, `modifier`,
-  `descriptor`, `object`, `function`, `registry`; `compile` is planned for the
-  compile-time half, see @.agents/design.md §14), matching @.agents/design.md §4
-  and the actual partition layout (see @.agents/review.md "Phase 3" for why
-  `:type` / `:field` / `:method` converge into `:object`).
+  `descriptor`, `meta`, `object`, `function`, `registry`, `compile`), matching
+  @.agents/design.md §4 and the actual partition layout (see @.agents/review.md
+  "Phase 3" for why `:type` / `:field` / `:method` converge into `:object`).
 - Put public API in `export namespace speculo { ... }`. Internal implementation
   details go in namespace `speculo::detail` (never exported from the umbrella
   module), matching @.agents/design.md §3.

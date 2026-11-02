@@ -9,6 +9,7 @@ import std;
 import :error;
 import :modifier;
 import :descriptor;
+import :meta;
 
 export namespace speculo
 {
@@ -24,35 +25,6 @@ class Enumerator;
 class Array;
 class TemplateArgument;
 class Callable;
-
-/**
- * @brief Structural string usable as a non-type template parameter
- *
- * `std::string_view` is not a structural type in libstdc++ (its size member is
- * private), so this small wrapper enables compile-time constant names such as
- * `cls.get_method<"scale", int>()`.
- */
-template<std::size_t N>
-struct FixedString
-{
-    char data[N]{};
-
-    constexpr FixedString(const char (&str)[N])
-    {
-        for (std::size_t i = 0; i < N; ++i)
-        {
-            data[i] = str[i];
-        }
-    }
-
-    [[nodiscard]] constexpr operator std::string_view() const noexcept
-    {
-        return std::string_view(data, N - 1);
-    }
-};
-
-template<std::size_t N>
-FixedString(const char (&)[N]) -> FixedString<N>;
 
 template<typename T>
 [[nodiscard]] auto class_of() -> const Class&;
@@ -4273,22 +4245,6 @@ inline auto receiver_mismatch(std::string_view callee, const TypeDescriptor* dec
 // Reflection-driven materialization (the only place that touches <meta>)
 // ─────────────────────────────────────────────────────────────────────────────
 
-export namespace speculo::detail
-{
-
-/**
- * @brief Annotation attached to SPECULO_IMPL(_VIRTUAL)'s synthesized accessor
- *
- * The one entity of speculo::detail that is exported: the macros expand in user
- * translation units and name it. Everything else in speculo::detail is private to
- * the module.
- */
-struct reflect_impl_tag
-{
-};
-
-} // namespace speculo::detail
-
 namespace speculo::detail
 {
 
@@ -4303,27 +4259,6 @@ namespace meta = std::meta;
  * stays read-only; this is the single one-time side effect (see design §8).
  */
 void register_type(const Class& cls);
-
-/// Public-only member access context (invoked at namespace scope).
-consteval auto public_context() -> meta::access_context
-{
-    return meta::access_context::current();
-}
-
-/// Reflection of T (bundle is only instantiated with canonical types).
-template<typename T>
-consteval auto info_of() -> meta::info
-{
-    return ^^T;
-}
-
-/// Whether C names an unqualified class/union (the only types whose members are
-/// materialized; cv-qualified class types only carry identity + decomposition).
-consteval auto is_unqualified_class(meta::info C) -> bool
-{
-    return (meta::is_class_type(C) || meta::is_union_type(C))
-        && !meta::is_const_type(C) && !meta::is_volatile_type(C);
-}
 
 /// Whether C names an unqualified, non-array object type (value thunk carrier).
 consteval auto is_unqualified_object(meta::info C) -> bool
@@ -4363,206 +4298,6 @@ consteval auto has_canonical_name(meta::info C) -> bool
     return has_canonical_name(parent);
 }
 
-// Whether the entity is declared (at any depth) inside namespace std.
-consteval auto is_in_std_namespace(meta::info entity) -> bool
-{
-    for (meta::info scope = meta::parent_of(entity); scope != ^^::; scope = meta::parent_of(scope))
-    {
-        if (meta::is_namespace(scope) && meta::has_identifier(scope) && meta::identifier_of(scope) == "std")
-        {
-            return true;
-        }
-    }
-    return false;
-}
-
-/**
- * @brief Whether `type` is a standard-library type (namespace `std`, any depth)
- *
- * Such types are materialized shallowly: name, size, alignment, and the value
- * operations an `Object` needs (copy, destroy, assign). Their fields, methods,
- * constructors, bases, and enumerators are not enumerated, so holding a
- * `std::string` does not pull `basic_string`'s signature closure into the
- * program. A user type that *has* a `std::` member, or a function whose
- * signature *uses* a `std::` type, still reflects that member or function;
- * only the standard type itself is not expanded.
- */
-consteval auto is_std_type(meta::info type) -> bool
-{
-    if (!meta::has_parent(type))
-    {
-        return false;
-    }
-
-    return is_in_std_namespace(type);
-}
-
-template<meta::info C>
-consteval auto public_field_count() -> std::size_t
-{
-    if constexpr (is_unqualified_class(C) && !is_std_type(C))
-    {
-        return meta::nonstatic_data_members_of(C, public_context()).size()
-             + meta::static_data_members_of(C, public_context()).size();
-    }
-    else
-    {
-        return 0;
-    }
-}
-
-template<meta::info C, std::size_t I>
-consteval auto public_field_member() -> meta::info
-{
-    if constexpr (I < meta::nonstatic_data_members_of(C, public_context()).size())
-    {
-        return meta::nonstatic_data_members_of(C, public_context())[I];
-    }
-    else
-    {
-        return meta::static_data_members_of(C, public_context())[I - meta::nonstatic_data_members_of(C, public_context()).size()];
-    }
-}
-
-/**
- * @brief Annotation attached to SPECULO_IMPL(_VIRTUAL)'s synthesized accessor
- *
- * The accessor (`get_class()`) is reflection plumbing: it exists to bridge a
- * concrete type to its Class. Reflecting it would drag in `const Class&` (and
- * hence `Class`'s whole signature closure, which reaches crab_cpp's move-only
- * variants), so annotated methods are excluded from the member tables. The
- * annotation is a plain `[[= detail::reflect_impl_tag{}]]` attribute.
- */
-consteval auto is_reflect_impl_annotation(meta::info annotation) -> bool
-{
-    return meta::is_annotation(annotation)
-        && meta::remove_cv(meta::type_of(annotation)) == ^^reflect_impl_tag;
-}
-
-// Whether the type is a specialization of std::allocator.
-consteval auto is_std_allocator_specialization(meta::info type) -> bool
-{
-    return meta::has_template_arguments(type) && meta::template_of(type) == ^^std::allocator;
-}
-
-// A non-template member function with an explicit object parameter
-// (`void f(this C& self)`). `parameters_of` lists the object parameter first, so
-// the reflected parameter list would be wrong and `member_function_pointer`
-// would build a pointer type `extract` rejects; such members are not enumerated.
-// (Templates -- including deducing-this ones -- are not `is_function` at all.)
-consteval auto has_explicit_object_parameter(meta::info function) -> bool
-{
-    const auto parameters = meta::parameters_of(function);
-    return !parameters.empty() && meta::is_explicit_object_parameter(parameters[0]);
-}
-
-consteval auto is_reflectable_method(meta::info member) -> bool
-{
-    // Function templates (and conversion / operator templates) are separate
-    // reflections for which is_function() is false.
-    if (!meta::is_function(member))
-    {
-        return false;
-    }
-
-    // GCC instantiates the definition of every function whose reflection is held
-    // in a constant (even without calling it). Non-public members of standard
-    // library types are implementation detail and may be ill-formed for a given
-    // instantiation (tuple's const _M_swap), which would be a hard error inside
-    // class_of<T>() of any type holding e.g. a std::unique_ptr. Never touch them.
-    if (!meta::is_public(member) && is_in_std_namespace(meta::parent_of(member)))
-    {
-        return false;
-    }
-
-    // std::allocator's members are not reflected. Taking their addresses (which
-    // the invoker thunks do) needs out-of-line definitions that `extern template
-    // class std::allocator<char>` promises but libstdc++ does not provide for
-    // `allocate` / `deallocate` / `allocate_at_least` -- with `import std` the
-    // program then fails to link. std::string's allocator base would otherwise
-    // drag them into every class that has a std::string member.
-    if (is_std_allocator_specialization(meta::parent_of(member)))
-    {
-        return false;
-    }
-
-    // SPECULO_IMPL(_VIRTUAL)'s synthesized accessor is excluded (see
-    // reflect_impl_tag): reflecting it would pull in `const Class&`.
-    for (auto annotation : meta::annotations_of(member))
-    {
-        if (is_reflect_impl_annotation(annotation))
-        {
-            return false;
-        }
-    }
-
-    if (meta::is_constructor(member))
-    {
-        return false;
-    }
-
-    if (meta::is_destructor(member))
-    {
-        // Only user-declared destructors are surfaced (every class has an
-        // implicitly-declared one, which would otherwise pollute every table).
-        return meta::is_user_declared(member);
-    }
-
-    if (has_explicit_object_parameter(member))
-    {
-        return false;
-    }
-
-    // Of the remaining special members only copy / move assignment is listed, and
-    // only when user-declared (every class has implicit ones that would pollute
-    // all tables). Deleted functions stay in the table too: they cannot be
-    // `extract`ed, so they get a null invoker (see make_method_desc).
-    if (meta::is_copy_assignment(member) || meta::is_move_assignment(member))
-    {
-        return meta::is_user_declared(member);
-    }
-
-    return !meta::is_special_member_function(member);
-}
-
-template<meta::info C>
-consteval auto public_method_count() -> std::size_t
-{
-    if constexpr (is_unqualified_class(C) && !is_std_type(C))
-    {
-        std::size_t count = 0;
-        for (auto member : meta::members_of(C, public_context()))
-        {
-            if (is_reflectable_method(member))
-            {
-                ++count;
-            }
-        }
-        return count;
-    }
-    else
-    {
-        return 0;
-    }
-}
-
-template<meta::info C, std::size_t I>
-consteval auto public_method_member() -> meta::info
-{
-    std::size_t index = 0;
-    for (auto member : meta::members_of(C, public_context()))
-    {
-        if (is_reflectable_method(member))
-        {
-            if (index == I)
-            {
-                return member;
-            }
-            ++index;
-        }
-    }
-    return meta::info{};
-}
 
 template<meta::info C, std::size_t I>
 consteval auto method_parameter_count() -> std::size_t
@@ -4585,11 +4320,6 @@ consteval auto max_parameters() -> std::size_t
 }
 
 // ── Declared view (all members, including private/protected; own class) ──
-
-consteval auto unchecked_context() -> meta::access_context
-{
-    return meta::access_context::unchecked();
-}
 
 /**
  * @brief Whether C is a Java-style interface: an abstract class with no
@@ -4628,72 +4358,6 @@ consteval auto is_interface_class(meta::info C) -> bool
     }
 
     return true;
-}
-
-template<meta::info C>
-consteval auto declared_field_count() -> std::size_t
-{
-    if constexpr (is_unqualified_class(C) && !is_std_type(C))
-    {
-        return meta::nonstatic_data_members_of(C, unchecked_context()).size()
-             + meta::static_data_members_of(C, unchecked_context()).size();
-    }
-    else
-    {
-        return 0;
-    }
-}
-
-template<meta::info C, std::size_t I>
-consteval auto declared_field_member() -> meta::info
-{
-    if constexpr (I < meta::nonstatic_data_members_of(C, unchecked_context()).size())
-    {
-        return meta::nonstatic_data_members_of(C, unchecked_context())[I];
-    }
-    else
-    {
-        return meta::static_data_members_of(C, unchecked_context())[I - meta::nonstatic_data_members_of(C, unchecked_context()).size()];
-    }
-}
-
-template<meta::info C>
-consteval auto declared_method_count() -> std::size_t
-{
-    if constexpr (is_unqualified_class(C) && !is_std_type(C))
-    {
-        std::size_t count = 0;
-        for (auto member : meta::members_of(C, unchecked_context()))
-        {
-            if (is_reflectable_method(member))
-            {
-                ++count;
-            }
-        }
-        return count;
-    }
-    else
-    {
-        return 0;
-    }
-}
-
-template<meta::info C, std::size_t I>
-consteval auto declared_method_member() -> meta::info
-{
-    std::size_t index = 0;
-    for (auto member : meta::members_of(C, unchecked_context()))
-    {
-        if (is_reflectable_method(member))
-        {
-            if (index == I)
-            {
-                return member;
-            }
-            ++index;
-        }
-    }
-    return meta::info{};
 }
 
 template<meta::info C, std::size_t I>
@@ -5689,7 +5353,7 @@ consteval auto make_field_desc(const TypeDescriptor* type, const TypeDescriptor*
     using F = std::remove_cvref_t<FieldType>;
 
     FieldDesc desc{};
-    desc.name = std::define_static_string(meta::has_identifier(M) ? meta::identifier_of(M) : meta::display_string_of(M));
+    desc.name = std::define_static_string(member_name(M));
     desc.type = type;
     desc.declaring_class = declaring;
     desc.size = sizeof(F);
@@ -6035,7 +5699,7 @@ consteval auto make_method_desc(const TypeDescriptor* declaring, const TypeDescr
                                 std::size_t parameter_count) -> MethodDesc
 {
     MethodDesc desc{};
-    desc.name = std::define_static_string(meta::has_identifier(M) ? meta::identifier_of(M) : meta::display_string_of(M));
+    desc.name = std::define_static_string(member_name(M));
     desc.signature = std::define_static_string(meta::display_string_of(M));
     desc.declaring_class = declaring;
     desc.return_type = return_type;
@@ -6810,13 +6474,17 @@ template<typename T>
 inline constexpr TypeBundle<T> bundle = []() consteval -> TypeBundle<T>
 {
     constexpr meta::info C = info_of<T>();
+    constexpr auto public_fields = collect_fields<T>();
+    constexpr auto public_methods = collect_methods<T>();
+    constexpr auto declared_fields = collect_declared_fields<T>();
+    constexpr auto declared_methods = collect_declared_methods<T>();
     TypeBundle<T> b{};
 
-    [&b]<std::size_t... I>(std::index_sequence<I...>)
+    [&]<std::size_t... I>(std::index_sequence<I...>)
     {
-        (([&b]()
+        (([&]()
         {
-            constexpr meta::info M = public_field_member<C, I>();
+            constexpr meta::info M = public_fields[I];
             using FT = typename[: meta::type_of(M) :];
             b.field_descs[I] = make_field_desc<M>(std::addressof(bundle<FT>.desc),
                                                   std::addressof(bundle<T>.desc));
@@ -6824,11 +6492,11 @@ inline constexpr TypeBundle<T> bundle = []() consteval -> TypeBundle<T>
         }()), ...);
     }(std::make_index_sequence<public_field_count<C>()>{});
 
-    [&b]<std::size_t... I>(std::index_sequence<I...>)
+    [&]<std::size_t... I>(std::index_sequence<I...>)
     {
-        (([&b]()
+        (([&]()
         {
-            constexpr meta::info M = public_method_member<C, I>();
+            constexpr meta::info M = public_methods[I];
             const TypeDescriptor* return_desc = nullptr;
             if constexpr (!meta::is_destructor(M))
             {
@@ -6860,11 +6528,11 @@ inline constexpr TypeBundle<T> bundle = []() consteval -> TypeBundle<T>
         }()), ...);
     }(std::make_index_sequence<public_method_count<C>()>{});
 
-    [&b]<std::size_t... I>(std::index_sequence<I...>)
+    [&]<std::size_t... I>(std::index_sequence<I...>)
     {
-        (([&b]()
+        (([&]()
         {
-            constexpr meta::info M = declared_field_member<C, I>();
+            constexpr meta::info M = declared_fields[I];
             using FT = typename[: meta::type_of(M) :];
             b.declared_field_descs[I] = make_field_desc<M>(std::addressof(bundle<FT>.desc),
                                                            std::addressof(bundle<T>.desc));
@@ -6872,11 +6540,11 @@ inline constexpr TypeBundle<T> bundle = []() consteval -> TypeBundle<T>
         }()), ...);
     }(std::make_index_sequence<declared_field_count<C>()>{});
 
-    [&b]<std::size_t... I>(std::index_sequence<I...>)
+    [&]<std::size_t... I>(std::index_sequence<I...>)
     {
-        (([&b]()
+        (([&]()
         {
-            constexpr meta::info M = declared_method_member<C, I>();
+            constexpr meta::info M = declared_methods[I];
             const TypeDescriptor* return_desc = nullptr;
             if constexpr (!meta::is_destructor(M))
             {

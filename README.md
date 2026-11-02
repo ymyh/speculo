@@ -6,6 +6,8 @@ The vocabulary follows `java.lang.reflect`. Names follow C++: `get_name`, `get_d
 
 Every descriptor is a compile-time constant. `class_of<T>()` is a pointer to that table. The library does not use RTTI or exceptions. Missing names come back as `Option`; failed operations come back as `Result`.
 
+A separate compile-time half (`speculo:compile`) walks fields with `for_each_field` and exposes a `constexpr` layout table, with no runtime lookup; see [Compile-time traversal](#compile-time-traversal).
+
 ```cpp
 import std;
 import crab_cpp;
@@ -174,6 +176,27 @@ Annotations are not inherited. An annotation on a base-specifier belongs to that
 
 A value whose type contains a pointer or a reference is listed, but `is_readable()` is false and `get<T>()` is empty. On GCC 16.2, `[[= "literal"]]` has type `const char*` and cannot be read back. A `std::array<char, N>` can. Annotations on `= delete` functions are not enumerated: querying them instantiates the function body, and a deleted function has none.
 
+## Compile-time traversal
+
+`import speculo;` also exports the compile-time half (`speculo:compile`). It builds no runtime table: the traversal is expanded by `template for`, and `field_table<T>` is a `constexpr` array.
+
+```cpp
+speculo::for_each_field(point, [](std::string_view name, const auto& value)
+{
+    std::println("{} = {}", name, value);       // real field type, no boxing
+});
+
+speculo::for_each_member<Point>([](std::string_view name, speculo::MemberKind kind)
+{
+    // kind: Field / StaticField / Method / Destructor
+});
+
+constexpr auto offsets = speculo::field_table<Point>;
+static_assert(offsets[0].offset == 0);
+```
+
+It sees the same public members, in the same order, as `get_fields()` / `get_methods()`: non-static fields first, then static fields; public only; no base expansion; `std` types stay shallow. Static fields have offset 0 and `is_static == true` in the table. Bit-fields arrive by value (there is no reference), so callbacks that must work for every field take `const auto&` or `auto&&`; plain fields are passed as lvalues and can be modified through `auto&`.
+
 ## Limits
 
 - Templates are not reflected, only concrete types. A `using` alias is the type it names; annotations on the alias are not visible.
@@ -190,5 +213,6 @@ A value whose type contains a pointer or a reference is listed, but `is_readable
 | `examples/02_construct_and_call.cpp` | Constructors, the three lookup paths, `Object` lifetime |
 | `examples/03_inheritance_enum_array.cpp` | Bases, enumerators, arrays |
 | `examples/04_registry_and_macros.cpp` | `for_name`, `SPECULO_REGISTER`, `SPECULO_IMPL` |
+| `examples/05_compile_time.cpp` | `for_each_field` / `for_each_member`, `field_table`, generated `to_json` and hashing |
 
 `speculo::version_string()` returns `"0.1.0"`.

@@ -624,21 +624,34 @@ C++26 静态反射的真正卖点是编译期遍历 + splice 生成代码。v1 �
 因此不违反「不要再拆模块分区」的铁律（那条铁律针对的是与 `Object`/`Class` 形成
 强连通分量的分区）。纯模板 + `consteval`：无运行期状态、无描述表、无注册表。
 
+为了让「收集规则只有一份」，实际落地新增了一个更低的 `speculo:meta` 分区：
+
+- `src/meta.cppm`：`FixedString`、`detail::reflect_impl_tag`、纯 `std::meta` 谓词与
+  **唯一收集器**（`detail::collect_fields<T>()` / `collect_methods<T>()`，以及
+  全访问视图的 `collect_declared_fields<T>()` / `collect_declared_methods<T>()`）。
+- `:object` 与 `:compile` 都 `import :meta`；`:object` 的物化循环直接消费
+  `collect_fields<T>()` / `collect_declared_fields<T>()` 等数组，不再各自扫描成员。
+- 主模块 `speculo` 同时 `export import :meta`（`FixedString` / `reflect_impl_tag` 的
+  用户可见性）与 `export import :compile`。
+
+`FixedString` 与 `reflect_impl_tag` 因此从 `:object` 下沉到 `:meta`，不再各有一份。
+
 ### 10.3 API
 
 ```cpp
 namespace speculo {
 
-// 成员数量（编译期常量）
-template <typename T> consteval std::size_t member_count();
-template <typename T> consteval std::size_t field_count();
+// 成员数量（编译期常量；cv/引用自动归一）
+template <typename T> consteval std::size_t member_count(); // 字段 + 方法
+template <typename T> consteval std::size_t field_count();  // 只算字段
 
-// 逐字段遍历：回调形状 f(std::string_view name, auto& value)
-// 顺序 = 声明顺序（基类不展开）
+// 逐字段遍历：回调 f(std::string_view name, value)
+// 顺序 = Class::get_fields()（非静态声明序，然后静态声明序；基类不展开）
 template <typename T, typename F>
 constexpr void for_each_field(T& obj, F&& f);
 
-// 逐成员遍历（含方法）：只给名字与类别，仍不暴露 meta::info
+// 逐成员遍历（字段 + 方法）：只给名字与类别，仍不暴露 meta::info
+// T 必须显式给出（没有对象可推导）
 template <typename T, typename F>
 constexpr void for_each_member(F&& f);
 
@@ -646,16 +659,29 @@ constexpr void for_each_member(F&& f);
 struct field_info
 {
     std::string_view name;
-    std::size_t      offset;
-    std::size_t      size;
+    std::size_t      offset;      // 静态成员恒为 0
+    std::size_t      size;        // remove_cvref_t<字段声明类型> 的 sizeof
     std::size_t      alignment;
     bool             is_bitfield;
+    bool             is_static;   // 静态成员没有对象内偏移；用这一位区分
 };
 
 template <typename T>
-inline constexpr std::array<field_info, field_count<T>()> field_table{};
+inline constexpr std::array<field_info, field_count<T>()> field_table;
+
+enum class MemberKind
+{
+    Field,        // 非静态数据成员
+    StaticField,  // 静态数据成员
+    Method,       // 成员函数（含转换运算符、静态成员函数）
+    Destructor,   // 用户声明的析构函数
+};
 }
 ```
+
+> **实现形状**：`field_table<T>` 由 `detail::make_field_table<T>()` 这个 `consteval`
+> 函数在常量求值时填好；声明里仍保留 `std::array<field_info, field_count<T>()>`
+> 的精确类型，因此可以直接 `static_assert(field_table<Point>[0].offset == 0)`。
 
 用法（按字段生成序列化，零运行期反射开销）：
 
@@ -684,14 +710,38 @@ static_assert(offsets[0].offset == 0);
 `if constexpr` 分派（数组、位域、嵌套结构体各走各的分支）——这正是运行期
 `Field::get` 做不到的。
 
-### 10.4 边界
+### 10.4 精确语义
 
-- 不展开基类（与 `get_fields()` 同一约定）；要包含基类自己写递归。
-- 遍历本身是 `constexpr` 展开，允许在运行期调用；回调不能是 `consteval`。
-- 位域字段以「读出的值」形式传入（`auto value`），不提供引用；需要写回用 `Field::set`。
-- `for_each_member` 不暴露 `meta::info`，方法只看到名字与类别；要调用仍走运行期 `Method`。
+- **与运行期同一份收集规则**：`field_count<T>()` == `class_of<T>().get_fields().size()`；
+  `member_count<T>()` == `get_fields().size() + get_methods().size()`。测试逐项交叉验证。
+- **包含静态数据成员**：`field_count` / `field_table` / `for_each_field` 都包含公开静态
+  成员，顺序与 `get_fields()` 一致（非静态在前、静态在后）。静态成员的 `offset` 恒为 0，
+  `field_info::is_static` 为 true；`for_each_field` 通过 `obj.[:member:]` 读它的值
+  （不依赖具体对象）。
+- **只含 public**：编译期没有类内访问权，私有/保护成员既不计数也不遍历；需要它们用
+  `get_declared_*`。
+- **不展开基类**（与 `get_fields()` 同一约定）；要包含基类自己写递归。
+- **`std` 类型浅物化**：`field_count<std::string>() == 0`，与运行期一致。
+- **cv / 引用归一**：`field_count<const Point>()`、`field_count<Point&>()` 都等于
+  `field_count<Point>()`；`for_each_field` 对 `const` 对象传 const 字段视图，对
+  `volatile` 对象传 volatile 字段视图。
+- **位域**：以「读出的值」形式传入（prvalue，无引用），需要写回用 `Field::set`。
+  因此回调应写成 `const auto&` / `auto&&` / `auto`；`auto&` 只能用于没有位域的字段集合。
+- **普通字段是左值**：回调参数写成 `auto&` 可以直接修改（数组、引用成员同样按声明类型
+  传递引用）。
+- **`for_each_member`**：字段在前、方法在后，与 `get_fields()` + `get_methods()` 的并集
+  一致；方法只给名字与 `MemberKind`，不暴露 `meta::info`。构造函数不在成员表里
+  （与 `get_methods()` 一致）。
+- **`field_info` 不提供 `bit_offset` / `bit_width`**：需要位级布局时用运行期
+  `Field::get_bit_offset()` / `get_bit_width()`；编译期表只承诺 `offset` / `size` /
+  `alignment` / `is_bitfield` / `is_static`。
+- **无错误路径**：编译期 API 不返回 `Option` / `Result` / `Status`，也没有空句柄；
+  非类类型与 `std` 类型的计数为 0、表为空、遍历不调用回调。
+- **`consteval` vs `constexpr`**：`member_count` / `field_count` 是 `consteval`；
+  `for_each_field` / `for_each_member` 是 `constexpr`，既可在运行期调用，也可在常量
+  求值中使用（字段都是字面类型时）。
 
-> **spike S8.9 结论（GCC 16.2 实测）**：`template for` 在**非模块的用户 TU** 可用，
+> **spike S8.9 / S11 结论（GCC 16.2 实测）**：`template for` 在**非模块的用户 TU** 可用，
 > 三种形态都通：字面量 `constexpr` 数组、`std::define_static_array(反射范围)`（反射范围
 > 必须先提升为 constexpr 范围，否则报「consteval-only variable `__for_range`」）、以及
 > splice 出成员名。反射范围用 `define_static_array` 是硬要求。
@@ -700,6 +750,12 @@ static_assert(offsets[0].offset == 0);
 > 另一条既有约束在 S8.9 复现：`consteval` 函数返回 `std::string` 时只能在
 > manifestly constant-evaluated 上下文（`static constexpr` / `define_static_string`）里调用，
 > 不能直接当运行期实参。
+>
+> **S11 补充**：模块导出的函数模板可以由用户 TU 用本地类型实例化，`template for` /
+> splice / 非导出内部收集器都正常；`obj.[:静态成员:]` 合法；位域必须先
+> `if constexpr (is_bit_field)` 再按值 `static_cast`，否则无法绑定引用。`for_each_field`
+> 的收集数组必须是 `static constexpr` 局部变量，否则 `template for` 报
+> 「address of non-static constexpr variable may differ」。
 
 
 ## 11. 零分配调用

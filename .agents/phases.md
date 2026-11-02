@@ -14,12 +14,13 @@
 `Enumerator` / `BaseClass` / `Array` / `Modifier`、双视图成员访问、三级查找、继承与 `cast_to`、
 注册表与 `SPECULO_IMPL` 家族。CMake 与 xmake 双系统全绿。
 
-**测试现状**：309 个用例（CMake 全绿，`ctest` 5/5；xmake 同样 5/5）。v1 的测试已按
+**测试现状**：324 个用例（CMake 全绿，`ctest` 6/6；xmake 同样 6/6）。v1 的测试已按
 @.agents/testing.md §2–§5 对齐，**7 张组合矩阵**覆盖 `Method::invoke`（5 × 5）、`Field::set`
 （5 × 5）、`Class::get_method`（5 × 4）、`Constructor::new_instance`（5 × 5）、`Array` 操作
 （5 × 4 + Option 列）、`cast_to`（5 × 2）、枚举三向互转（4 × 6），`Function` 侧的 6 张沿用；
 Phase 9 又加了 `Callable::invoke` 的接收者 × 实参表，Phase 10 加了值类别 / `Class::assign` /
-`invoke_with_defaults` / 存储期四张表。错误优先级（api_design §0.1）由矩阵中
+`invoke_with_defaults` / 存储期四张表，Phase 11 加了编译期遍历的对象形态 × 回调形态、
+成员形态 × 回调形态、字段表列 × 类型形态、两路计数一致性四张表。错误优先级（api_design §0.1）由矩阵中
 「同时两个错」的格子钉住。前 3 张的期望值由 `tools/gen_matrix.py` 枚举生成，其余按行内
 数据表。9 个句柄各自的「空句柄 → `panic`」死亡用例也已补齐（共 15 个 `EXPECT_DEATH`，
 约占 9 s 跑时，属预期开销）。
@@ -36,8 +37,8 @@ Phase 9 又加了 `Callable::invoke` 的接收者 × 实参表，Phase 10 加了
 **继续开发前必读的雷区（GCC 16.2 实测，v2 同样适用）**
 
 1. **不要再拆与 `:object` 互相引用的模块分区**。新类型并入 `:object` 或更低分区。
-   唯一的例外是 `:compile`（§Phase 11）：它只依赖 `<meta>` + `std`，不 import `:object`，
-   不形成强连通分量。
+   唯一的例外是 `:compile`（§Phase 11）：它只依赖 `<meta>` + `std` + `:meta`，
+   不 import `:object`，不形成强连通分量。
 2. **物化只能走单个 `TypeBundle<T>`（键在类型 `T`，不是 `meta::info`）**；bundle 初始化器里
    引用其它 bundle 必须用**依赖拼写**（`bundle<FT>`）。用具体拼写引用 `bundle<void>` 会把它
    错误初始化成默认描述符。
@@ -154,19 +155,27 @@ Phase 9 又加了 `Callable::invoke` 的接收者 × 实参表，Phase 10 加了
 **验收**：`std::unique_ptr` 字段可在右值视图下 move；`&&` 限定成员函数可调用；
 带默认实参的 `Function` 能按最少实参调用；`thread_local` 静态成员可识别。
 
-## Phase 11：编译期半层（3~5 天）
+## Phase 11：编译期半层（3~5 天）—— ✅ 已完成（2026-11-02）
 
 目标：`speculo:compile` 分区，把「编译期遍历」这半条路开放给用户。对应 api_design §10。
 
-- [ ] 抽出纯 meta 收集器：`detail::collect_fields<T>()` / `collect_methods<T>()`
+> 落地记录与 8 条实现偏差见 `review.md`「Phase 11」。与下文清单的不同：
+> 收集器与 `FixedString` / `reflect_impl_tag` 落在新增的 `:meta` 分区（`:compile` 与
+> `:object` 并列依赖它）；`for_each_member` 的类别用 `MemberKind` 枚举；
+> 示例生成的是 `to_json` / 字段哈希 / SoA 列视图 / 成员清单，没有生成 `operator==`
+> （`for_each_field` 不配对两个对象，按名配对需要额外的运行期查找，不适合当零开销示例）。
+
+- [x] 抽出纯 meta 收集器：`detail::collect_fields<T>()` / `collect_methods<T>()`
   （**运行期物化与编译期遍历共用**，避免规则漂移）
-- [ ] `src/compile.cppm`（`export module speculo:compile;`）：只 `import std` + `<meta>`
-- [ ] `member_count` / `field_count` / `for_each_field` / `for_each_member` / `field_info` /
-  `field_table<T>`
-- [ ] `FixedString` 下沉到不含反射的小分区，供 `:compile` 与 `:object` 共用
-- [ ] 构建系统：`CMakeLists.txt` 的 `CXX_MODULES` 与 `xmake.lua` 同时加入 `:compile`（双系统对等）
-- [ ] 示例：`examples/05_compile_time.cpp`（一行生成 `operator==`、`to_json`、SoA 偏移表）
-- [ ] 测试：`tests/compile_time_test.cpp`（含「运行期表与编译期遍历结果一致」的交叉校验）
+- [x] `src/compile.cppm`（`export module speculo:compile;`）：只 `import std` + `:meta`，
+  不 import `:object`
+- [x] `member_count` / `field_count` / `for_each_field` / `for_each_member` / `field_info` /
+  `field_table<T>`（另加 `MemberKind`）
+- [x] `FixedString` 下沉到不含描述表的 `:meta` 分区，供 `:compile` 与 `:object` 共用
+- [x] 构建系统：`CMakeLists.txt` 的 `CXX_MODULES` 与 `xmake.lua` 同时加入 `:meta` / `:compile`
+  （xmake 用 `src/*.cppm` 通配，双系统对等）
+- [x] 示例：`examples/05_compile_time.cpp`（`to_json`、字段哈希、SoA 列视图、成员清单）
+- [x] 测试：`tests/compile_time_test.cpp`（含「运行期表与编译期遍历结果一致」的交叉校验）
 
 **验收**：`for_each_field` 在用户 TU 可用；`field_table<T>` 为 `constexpr` 且可作偏移索引；
 运行期 `get_fields()` 与编译期 `for_each_field` 的字段集合/顺序完全一致（同一收集器）。

@@ -77,8 +77,10 @@ GCC 模块依赖规则（详见 @.agents/review.md「Phase 3」偏差 1）收敛
 | `speculo.error` | `ErrorKind`、`Error`、`Status`、`Result<T>` 别名 |
 | `speculo.modifier` | `Modifier`（Java 风格位掩码工具类）、`RefQualifier`、`TypeKind` |
 | `speculo.descriptor` | 描述层结构体（`TypeDescriptor`/`FieldDesc`/`MethodDesc`/...）与 thunk ABI（内部） |
+| `speculo.meta` | `FixedString`、`detail::reflect_impl_tag`、纯 `std::meta` 的**唯一成员收集器**（`collect_fields` / `collect_methods` / `collect_declared_*`） |
 | `speculo.object` | `Object` / `ObjectRef` / `Args` / `Class` / `Field` / `Method` / `Constructor`（Phase 3/4） |
 | `speculo.function` | `Function` / `function_of` / `overload_of`（自由函数，点名物化） |
+| `speculo.compile` | 编译期半层：`field_count` / `member_count` / `for_each_field` / `for_each_member` / `field_info` / `field_table` |
 | ~~`speculo.ctor`~~ | `Constructor` 已并入 `speculo.object`（模块分区拆分限制，见 review.md Phase 3/4 偏差） |
 | ~~`speculo.array`~~ | `Array` 已并入 `speculo.object`（沿用「不拆模块分区」约束，见 review.md Phase 5 偏差 4-8） |
 | `speculo.registry` | 名字 → `Class`、签名 → `Function` 的全局注册表，`Class::for_name` / `Function::for_name` |
@@ -86,7 +88,8 @@ GCC 模块依赖规则（详见 @.agents/review.md「Phase 3」偏差 1）收敛
 
 内部实现（物化逻辑、thunk 生成）放 `speculo::detail`（见 `src/object.cppm` 与
 `src/function.cppm` 内的 `module; #include <meta>` 全局模块片段 + `detail` 命名空间）。
-`:function` 依赖 `:object`，`:registry` 再依赖 `:function`，避免分区环。
+`:object` 与 `:compile` 都依赖 `:meta`；`:function` 依赖 `:object`，`:registry` 再依赖
+`:function`；`:compile` **不依赖 `:object`**，避免分区环。
 
 ## 5. 对象模型与生命周期
 
@@ -275,18 +278,24 @@ v1 的 `TypeDescriptor` 只回答「这是什么类型、有哪些成员」。v2
 
 ## 14. 编译期半层的分层位置
 
-v2 新增 `speculo:compile` 分区，放在分层图的最上层旁边，**不是中间**：
+v2 新增 `speculo:compile` 分区；它与 `:object` **并列**，两者都只向下依赖收集层：
 
 ```
-┌──────────────────────────────────────────────┐
-│ 编译期层  for_each_field / field_table /      │  ← 新：纯 constexpr，无运行期状态
-│           member_count（speculo:compile）     │
-├──────────────────────────────────────────────┤
-│ API 层    Class / Field / Method / …          │
-└──────────────────────────────────────────────┘
+┌─────────────────────────────┐   ┌─────────────────────────────┐
+│ 编译期层 :compile            │   │ 运行期 API 层 :object        │
+│ for_each_field / field_table │   │ Class / Field / Method / …   │
+│ member_count                 │   │                              │
+└──────────────┬──────────────┘   └──────────────┬──────────────┘
+               └───────────────┬──────────────────┘
+                               ▼
+              ┌──────────────────────────────────┐
+              │ :meta  纯 std::meta 收集器         │
+              │ collect_fields / collect_methods  │
+              │ FixedString / reflect_impl_tag     │
+              └──────────────────────────────────┘
 ```
 
-关键设计：**收集规则只有一份**。`detail` 里抽出一个纯 `std::meta` 的「成员视图」
+关键设计：**收集规则只有一份**。`:meta` 里抽出纯 `std::meta` 的「成员视图」
 （`collect_fields<T>()` / `collect_methods<T>()`，返回 `std::array<meta::info, N>`），
 运行期物化与编译期遍历都消费它。这样「哪些成员可反射、访问如何过滤、`std` 如何浅物化」
 永远只有一处定义，不会两边漂移。
@@ -295,9 +304,10 @@ v2 新增 `speculo:compile` 分区，放在分层图的最上层旁边，**不�
 编译期需要类型保真（真实 `T&`）；合并会让两边都变慢，还会把 `meta::info` 拖进用户代码。
 二者是两条独立的路，共享同一个收集器。
 
-分区边界安全：`:compile` 只 `import std` + `<meta>`，**不 import `:object`**，
+分区边界安全：`:compile` 只 `import std` + `:meta`，**不 import `:object`**，
 因此不会形成 §4 铁律所指的强连通分量。代价是它不能复用 v1 的句柄类型；
-`FixedString` 需要随之下沉到一个不含反射的小分区，实现时定。
+`FixedString` 与 `reflect_impl_tag` 随之下沉到不含描述表的 `:meta` 分区，
+由主模块 `export import :meta` 暴露给用户。
 
 ## 15. 操作语义：值类别、移动、零分配
 

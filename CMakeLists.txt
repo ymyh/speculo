@@ -74,9 +74,11 @@ target_sources(speculo
             src/error.cppm
             src/modifier.cppm
             src/descriptor.cppm
+            src/meta.cppm
             src/object.cppm
             src/function.cppm
             src/registry.cppm
+            src/compile.cppm
             src/mod.cppm
 )
 

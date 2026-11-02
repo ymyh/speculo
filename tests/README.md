@@ -25,6 +25,10 @@ comment above the loop, and every cell of the product is asserted:
 | `Class::assign` matrix | `move_test.cpp` | destination form × source form (5 × 6); swap 5 × 5; move_from 3 × 2 |
 | `invoke_with_defaults` matrix | `default_argument_test.cpp` | receiver × argument form (5 × 6); arity 4 each |
 | `Field::is_thread_local` / `get_static_address` matrix | `storage_test.cpp` | member kind × query (5 × 2) |
+| `for_each_field` matrix | `compile_time_test.cpp` | object form × callback form (6 × 4) |
+| `for_each_member` matrix | `compile_time_test.cpp` | type form × callback form (7 × 3) |
+| `field_table<T>` matrix | `compile_time_test.cpp` | type form × column (6 × 6), cross-checked with `Field` |
+| count two-path matrix | `compile_time_test.cpp` | type form × source (8 × 2) |
 | `IntBindingMatrix`, `NumericExactMatchMatrix`, `PointerBindingMatrix`, `BoxBindingMatrix`, `OptionStateMatrix`, `ResultStateMatrix` | `function_test.cpp` | free-function arguments / return kinds |
 
 The precedence tables (`MethodInvokeMatrix`, `FieldSetMatrix`, `ClassMethodLookupMatrix`)
@@ -65,6 +69,7 @@ from per-row data, so their tables are written literally next to the loop.
 | `move_test.cpp` | `Class::assign` / `swap` / `destroy`, `Object::move_from` |
 | `default_argument_test.cpp` | `default_argument<T>`, `get_parameter_default`, `invoke_with_defaults` |
 | `storage_test.cpp` | `Field::is_thread_local` / `get_static_address`, conversion / variadic modifiers |
+| `compile_time_test.cpp` | `speculo:compile`: `field_count` / `member_count` / `for_each_field` / `for_each_member` / `field_info` / `field_table`, cross-checked with the runtime tables |
 | `cross_tu_support.cpp` | Support TU for the cross-translation-unit function test |
 
 ## Shared fixtures

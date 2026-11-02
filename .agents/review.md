@@ -705,3 +705,54 @@ S8 没有覆盖「这些能力能不能被**物化**进运行期描述表」，P
 接收者 × 实参 6 × 2（`&&`）/ 6 × 1（`&` 与无 qualifier）、存储期 5 × 2；全部 ≤ 64 格，
 因此用全笛卡尔积而不是 pairwise，每个格子都有断言。
 
+
+
+## 11. Phase 11：编译期半层（2026-11-02 完成）
+
+环境同上（MSYS2 ucrt64 GCC 16.2.0，`-std=c++26 -freflection -fno-rtti -fno-exceptions`）。
+落地内容：新增 `:meta` 分区（`FixedString`、`reflect_impl_tag`、唯一成员收集器），
+`:compile` 分区（`field_count` / `member_count` / `for_each_field` / `for_each_member` /
+`field_info` / `field_table` / `MemberKind`）；`:object` 的物化循环改为消费同一收集器。
+`ctest` 6/6，324 个用例全绿（新增 15 个）；xmake 同样 6/6。
+
+### 11.1 动手前补做的探针（`spikes/s11_*`）
+
+| 文件 | 覆盖 | 结论 |
+|---|---|---|
+| `s11_mod.cppm` + `s11_user.cpp` | 模块导出的函数模板在用户 TU 用本地类型实例化；`template for` / splice / 非导出内部收集器；静态成员、位域、const 对象 | 全部可用；位域必须先 `if constexpr (is_bit_field)` 再按值 `static_cast`；`obj.[:静态成员:]` 合法；导出模板调用 `:meta` 的非导出收集器正常 |
+
+> **GCC 16.2 已知问题（测试 fixture 规避）**：匿名命名空间里的类型如果含有匿名联合体，
+> 物化其联合成员的注解集时汇编层会报 `AnnotationSet<...>::count` 重复定义。把该 fixture
+> 放到具名命名空间（与 `tests/std_library_test.cpp` 的 `p6c::Anon` 一致）即可规避；
+> 库代码无需改动。
+
+### 11.2 实现偏差（已回写 `api_design.md` §10 与 `design.md` §4/§14）
+
+| 项 | 原设计 | 实际 | 原因 |
+|---|---|---|---|
+| 收集器分区 | 「`detail` 里抽出」，未指定分区 | 新增 `speculo:meta`；`:compile` 与 `:object` 并列依赖它 | `:compile` 不能 import `:object`，`:object` 又必须复用收集器；只有下沉到共同依赖才不形成环 |
+| `FixedString` / `reflect_impl_tag` | 下沉到「不含反射的小分区」 | 与收集器同放 `:meta` | 收集器需要 `reflect_impl_tag`；再拆一个 `:basic` 只多一次分区构建，收益不足 |
+| `for_each_member` 的类别 | 只说「名字与类别」 | `MemberKind { Field, StaticField, Method, Destructor }` | 静态字段与析构函数在运行期表里可区分，编译期也应能区分 |
+| 静态数据成员 | 设计未明确 | `field_count` / `field_table` / `for_each_field` 都包含，顺序与 `get_fields()` 一致 | phases.md 的验收要求「字段集合/顺序完全一致」；静态成员可通过 `obj.[:member:]` 读取 |
+| `field_table` 初始化 | 声明为 `field_table{}` | `inline constexpr ... = detail::make_field_table<T>()` | 默认初始化无法填表；类型仍是 `std::array<field_info, field_count<T>()>` |
+| `field_info` 位域信息 | 只有 `is_bitfield` | 保持无 `bit_offset` / `bit_width`；另加 `is_static` | 位级布局走运行期 `Field`；静态字段的 offset 恒 0，没有 `is_static` 就无法与偏移 0 的实例字段区分 |
+| 示例的 `operator==` | 「一行生成 `operator==`」 | 示例生成 `to_json` / 字段哈希 / SoA 列视图 / 成员清单 | `for_each_field` 一次只给一个对象；按名配对两个对象需要运行期查找或字节偏移技巧，不适合作为零开销示例 |
+| `for_each_field` 的局部范围 | 「constexpr 展开」 | 收集数组必须是 `static constexpr` 局部变量 | 普通 `constexpr` 局部变量的地址在每次调用可能不同，`template for` 拒绝 |
+
+### 11.3 测试
+
+新增 `tests/compile_time_test.cpp`（15 个用例），按 .agents/testing.md §2–§5：
+
+| 矩阵 | 规模 | 覆盖 |
+|---|---|---|
+| `ForEachFieldMatrix` | 对象形态 6 × 回调形态 4 = 24 | 典型 / 空 / 仅静态 / 位域+数组+引用+静态 / const / volatile × `const auto&` / `auto&&` / 函数对象 / mutable lambda |
+| `ForEachMemberMatrix` | 类型形态 7 × 回调形态 3 = 21 | 典型 / 空 / 仅静态 / 含方法+析构 / 私有成员 / `std::string` / `int`；逐项与运行期 `get_fields()` + `get_methods()` 并集对比 |
+| `FieldTableMatrix` | 类型形态 6 × 列 6 = 36 | name / offset / size / alignment / is_bitfield / is_static 与运行期 `Field` 逐格一致；空类型与 `int` 断言表为空 |
+| count 两路一致性 | 类型形态 8 × 来源 2 = 16 | `field_count` / `member_count` 与运行期计数逐项一致 |
+
+另有用例覆盖：运行期 `get_fields()` 与 `for_each_field` 的名字/顺序逐项一致（含 const、std、非类类型）、
+匿名联合体字段（具名命名空间 fixture）、真实值读写、位域按值传递、数组/引用/静态成员、
+`static_assert` 常量求值、`field_table` 作为常量索引、cv/引用归一、
+`MemberKind::Destructor` 与运行期析构名一致。
+
+`Clang`/MSVC 未验证（本库只面向 GCC 16+）。双构建系统（CMake + xmake）均全绿。
