@@ -658,7 +658,7 @@ S8 没有覆盖「这些能力能不能被**物化**进运行期描述表」，P
 
 `Clang`/MSVC 未验证（本库只面向 GCC 16+）。双构建系统（CMake + xmake）均全绿。
 
-> **补测（Phase 13 审计，用 `speculo-tests` skill 的门禁复检）**：`base_offset_test.cpp` 原先
+> **补测（Phase 13 审计，用 `contract-tests` skill 的门禁复检）**：`base_offset_test.cpp` 原先
 > 缺三格——`BaseClass{}`（V3）的 `None`、`Option` 的第三条 `None` 路径、以及 `bool` 的 false
 > 侧（`is_private()` / `is_virtual()` 只断了 true）。已补齐并把「值类 × 期望」表改写进文件头
 > （含 V2 / V4 的 N/A 理由）。同时发现一条未写进契约的语义：`BaseClass` 是聚合值而非句柄，
@@ -865,9 +865,17 @@ S8 没有覆盖「这些能力能不能被**物化**进运行期描述表」，P
 |---|---|
 | `get_qualified_name()` 的 `{aka ...}` | 探针确认 GCC 16.2 不产生；不变更实现，保留归一化兜底与既有测试 |
 | 私有/保护构造函数不可 `new_instance` | 写进 `design.md` §11 第 10 条与 README「Limits」 |
-| `Array::new_instance` 元素为数组 | 写进 `design.md` §11 第 11 条与 README「Limits」；`can_dynamic_array` 本就排除数组 |
+| `Array::new_instance` 元素为数组 | 原为**已知限制**，现已支持：数组元素可作动态数组的元素类型，`rank` 为 `1 + rank(E)`（见下方「后续变更」） |
 | `SECONDARY` 示例 | 文档里只有这一处出现，判定为遗留笔误，已从 `phases.md` 删除 |
 | `proxy_demo` | 用社区接手的 [ngcpp/proxy](https://github.com/ngcpp/proxy) 4.1.0（微软已停止维护），`examples/06_proxy_demo.cpp`；CMake 用 `FetchContent` + `msft_proxy4` 目标，xmake 在 `xmake.lua` 里声明 `ngproxy` 包（与 crab_cpp 同一写法），两套构建系统保持对等 |
+
+> **后续变更（多维数组）**：`Array` 新增逐维下标 `get` / `get_ref` / `set(array, {i, j, ...})` 与
+> `get_length(array, dimension)`；`can_dynamic_array` 不再排除数组，`Array::new_instance(class_of<int[3]>(), n)`
+> 得到 `int[n][3]`（`array_rank = 1 + rank(E)`），数组元素逐项 `value_init_at` 初始化、`std::destroy_at` 析构。
+> 上表「`Array::new_instance` 元素为数组」一行的已知限制作废；`design.md` §11 第 11 条、
+> `README.md`「Arrays」/「Limits」与 `phases.md` 已同步。测试：`tests/array_test.cpp` 的
+> `ArrayMultiIndexMatrix`（3 × 6 与 5 × 3）、`ArrayLengthMatrix`（6 × 4）、`ArrayNewInstanceMatrix`
+> （6 × 3），以及 6 个多维/动态多维单用例；三路乘积 90 > 64，按 §3 拆成两张二路矩阵 + 优先级补格。
 
 ### 13.5 测试（`tests/type_graph_test.cpp`，16 个用例 / 4 张矩阵）
 

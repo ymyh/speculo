@@ -4274,7 +4274,7 @@ public:
         return Object::from_raw(data, element->dynamic_array);
     }
 
-    /// The array length; TypeMismatch when obj is not an array.
+    /// The array length of the outermost dimension; TypeMismatch when obj is not an array.
     [[nodiscard]] static auto get_length(ObjectRef array) -> Result<std::size_t, Error>
     {
         const auto view = view_of(array);
@@ -4286,93 +4286,87 @@ public:
         return view.unwrap().length;
     }
 
-    /// Reads element `index` as a boxed copy (NotSupported for non-copyable elements).
-    [[nodiscard]] static auto get(ObjectRef array, std::size_t index) -> Outcome<Object>
+    /**
+     * @brief The length of one dimension, counting from the outside
+     * @param dimension 0 is the outermost dimension
+     * @return InvalidArgument when `dimension` is not smaller than the rank
+     */
+    [[nodiscard]] static auto get_length(ObjectRef array, std::size_t dimension) -> Result<std::size_t, Error>
     {
-        const auto view = bounds_checked(array, index);
+        if (dimension == 0)
+        {
+            return get_length(array);
+        }
+
+        const auto view = view_of(array);
         if (view.is_err())
         {
             return view.unwrap_err();
         }
 
-        const detail::TypeDescriptor* element = view.unwrap().element;
-        if (array.is_volatile() || view.unwrap().element_is_volatile)
+        const detail::TypeDescriptor* desc = array.descriptor();
+        if (dimension >= desc->array_rank)
         {
-            return Error{ErrorKind::NotSupported,
-                         "Array::get() on volatile elements is not supported; use get_ref() and as<volatile T>()"};
+            return Error{ErrorKind::InvalidArgument,
+                         std::format("Array::get_length: dimension {} is out of range (rank {})", dimension,
+                                     desc->array_rank)};
         }
 
-        if (element->clone == nullptr)
+        // Every dimension past the outermost is a static extent, even under a
+        // dynamic outer array: the element of `E[n]` / `E[]` is the static `E`.
+        for (std::size_t level = 0; level < dimension; ++level)
         {
-            return Error{ErrorKind::NotSupported,
-                         std::format("Array::get: the element type '{}' is not copy-constructible",
-                                     element->qualified_name)};
+            desc = desc->element;
         }
 
-        return Object::from_raw(element->clone(element_address(array, index)), element);
+        return desc->array_extent;
+    }
+
+    /// Reads element `index` as a boxed copy (NotSupported for non-copyable elements).
+    [[nodiscard]] static auto get(ObjectRef array, std::size_t index) -> Outcome<Object>
+    {
+        return get_at(array, std::span<const std::size_t>(&index, 1));
+    }
+
+    /**
+     * @brief Reads the element at a multi-dimensional index list
+     * @param indices One index per dimension, outermost first; at least one
+     * @return The boxed element; NotSupported when the index chain stops at a
+     *         sub-array (index it further, or use get_ref)
+     */
+    [[nodiscard]] static auto get(ObjectRef array, std::initializer_list<std::size_t> indices) -> Outcome<Object>
+    {
+        return get_at(array, std::span<const std::size_t>(indices.begin(), indices.size()));
     }
 
     /// Writes element `index` from `value` (exact element type required).
     [[nodiscard]] static auto set(ObjectRef array, std::size_t index, ObjectRef value) -> Status
     {
-        if (array.is_const())
-        {
-            return Error{ErrorKind::ReadOnly, "Array::set() called on a const array"};
-        }
+        return set_at(array, std::span<const std::size_t>(&index, 1), value);
+    }
 
-        const auto view = bounds_checked(array, index);
-        if (view.is_err())
-        {
-            return view.unwrap_err();
-        }
-
-        const detail::TypeDescriptor* element = view.unwrap().element;
-        if (view.unwrap().element_is_const)
-        {
-            return Error{ErrorKind::ReadOnly, "Array::set() called on an array of const elements"};
-        }
-
-        if (array.is_volatile() || view.unwrap().element_is_volatile)
-        {
-            return Error{ErrorKind::NotSupported,
-                         "Array::set() on volatile elements is not supported; use get_ref() and as<volatile T>()"};
-        }
-
-        if (value.is_null() || value.descriptor() != element)
-        {
-            return Error{ErrorKind::TypeMismatch,
-                         value.is_null()
-                             ? std::format("Array::set: the value is null, expected '{}'", element->qualified_name)
-                             : std::format("Array::set: the value has type '{}', expected '{}' (types must match "
-                                           "exactly)",
-                                           value.descriptor()->qualified_name, element->qualified_name)};
-        }
-
-        if (element->copy_assign == nullptr)
-        {
-            return Error{ErrorKind::NotSupported,
-                         std::format("Array::set: the element type '{}' is not copy-assignable",
-                                     element->qualified_name)};
-        }
-
-        element->copy_assign(element_address(array, index), value.raw_data());
-
-        return None{};
+    /**
+     * @brief Writes the element at a multi-dimensional index list
+     * @return The same errors as the single-index form; the index chain has to
+     *         reach an element, because an array has no whole-array assignment
+     */
+    [[nodiscard]] static auto set(ObjectRef array, std::initializer_list<std::size_t> indices, ObjectRef value) -> Status
+    {
+        return set_at(array, std::span<const std::size_t>(indices.begin(), indices.size()), value);
     }
 
     /// A view of element `index`; the view's type is the element's unqualified
     /// type, and its is_const() / is_volatile() also cover a cv-qualified element type.
     [[nodiscard]] static auto get_ref(ObjectRef array, std::size_t index) -> Result<ObjectRef, Error>
     {
-        const auto view = bounds_checked(array, index);
-        if (view.is_err())
-        {
-            return view.unwrap_err();
-        }
+        return get_ref_at(array, std::span<const std::size_t>(&index, 1));
+    }
 
-        return ObjectRef(element_address(array, index), view.unwrap().element,
-                         array.is_const() || view.unwrap().element_is_const,
-                         array.is_volatile() || view.unwrap().element_is_volatile);
+    /// A view of the element at a multi-dimensional index list; fewer indices
+    /// than the rank yield a view of the selected sub-array.
+    [[nodiscard]] static auto get_ref(ObjectRef array, std::initializer_list<std::size_t> indices) -> Result<ObjectRef, Error>
+    {
+        return get_ref_at(array, std::span<const std::size_t>(indices.begin(), indices.size()));
     }
 
     /// The element type of an array object; None for non-array objects.
@@ -4394,6 +4388,13 @@ private:
         bool                          element_is_const = false;
         bool                          element_is_volatile = false;
         std::size_t                   length = 0;
+    };
+
+    /// The array that holds the element selected by the last index, plus that index.
+    struct Location
+    {
+        ObjectRef   parent;
+        std::size_t index = 0;
     };
 
     /// Validates that obj is an array and reports its element type and length.
@@ -4448,6 +4449,182 @@ private:
         const detail::TypeDescriptor* element = array.descriptor()->element->decayed;
         char* base = const_cast<char*>(static_cast<const char*>(array.raw_data()));
         return base + index * element->size;
+    }
+
+    /// A view of `array[index]`, with the element's top-level cv folded into the handle.
+    [[nodiscard]] static auto element_ref(ObjectRef array, std::size_t index) -> Result<ObjectRef, Error>
+    {
+        const auto view = bounds_checked(array, index);
+        if (view.is_err())
+        {
+            return view.unwrap_err();
+        }
+
+        return ObjectRef(element_address(array, index), view.unwrap().element,
+                         array.is_const() || view.unwrap().element_is_const,
+                         array.is_volatile() || view.unwrap().element_is_volatile);
+    }
+
+    /// Walks every index but the last: each step selects the sub-array that the
+    /// next index applies to.
+    [[nodiscard]] static auto locate(ObjectRef array, std::span<const std::size_t> indices) -> Result<Location, Error>
+    {
+        if (indices.empty())
+        {
+            const auto view = view_of(array);
+            if (view.is_err())
+            {
+                return view.unwrap_err();
+            }
+
+            return Error{ErrorKind::InvalidArgument, "Array: at least one index is required"};
+        }
+
+        // A longer list cannot reach an element: the extra indices would apply
+        // to an element that is not an array. Say so instead of letting the walk
+        // fail with a type error on the element.
+        if (indices.size() > 1)
+        {
+            const auto view = view_of(array);
+            if (view.is_err())
+            {
+                return view.unwrap_err();
+            }
+
+            if (indices.size() > array.descriptor()->array_rank)
+            {
+                return Error{ErrorKind::InvalidArgument,
+                             std::format("Array: {} indices given for an array of rank {}", indices.size(),
+                                         array.descriptor()->array_rank)};
+            }
+        }
+
+        ObjectRef parent = array;
+        for (std::size_t level = 0; level + 1 < indices.size(); ++level)
+        {
+            auto sub_array = element_ref(parent, indices[level]);
+            if (sub_array.is_err())
+            {
+                return sub_array.unwrap_err();
+            }
+
+            parent = sub_array.unwrap();
+        }
+
+        return Location{ parent, indices.back() };
+    }
+
+    [[nodiscard]] static auto get_at(ObjectRef array, std::span<const std::size_t> indices) -> Outcome<Object>
+    {
+        auto location = locate(array, indices);
+        if (location.is_err())
+        {
+            return location.unwrap_err();
+        }
+
+        const Location step = location.unwrap();
+        const auto view = bounds_checked(step.parent, step.index);
+        if (view.is_err())
+        {
+            return view.unwrap_err();
+        }
+
+        const detail::TypeDescriptor* element = view.unwrap().element;
+        if (step.parent.is_volatile() || view.unwrap().element_is_volatile)
+        {
+            return Error{ErrorKind::NotSupported,
+                         "Array::get() on volatile elements is not supported; use get_ref() and as<volatile T>()"};
+        }
+
+        if (element->kind == TypeKind::Array)
+        {
+            return Error{ErrorKind::NotSupported,
+                         std::format("Array::get: the selected element '{}' is itself an array; index it further "
+                                     "through get_ref()",
+                                     element->qualified_name)};
+        }
+
+        if (element->clone == nullptr)
+        {
+            return Error{ErrorKind::NotSupported,
+                         std::format("Array::get: the element type '{}' is not copy-constructible",
+                                     element->qualified_name)};
+        }
+
+        return Object::from_raw(element->clone(element_address(step.parent, step.index)), element);
+    }
+
+    [[nodiscard]] static auto set_at(ObjectRef array, std::span<const std::size_t> indices, ObjectRef value) -> Status
+    {
+        if (array.is_const())
+        {
+            return Error{ErrorKind::ReadOnly, "Array::set() called on a const array"};
+        }
+
+        auto location = locate(array, indices);
+        if (location.is_err())
+        {
+            return location.unwrap_err();
+        }
+
+        const Location step = location.unwrap();
+        const auto view = bounds_checked(step.parent, step.index);
+        if (view.is_err())
+        {
+            return view.unwrap_err();
+        }
+
+        const detail::TypeDescriptor* element = view.unwrap().element;
+        if (view.unwrap().element_is_const)
+        {
+            return Error{ErrorKind::ReadOnly, "Array::set() called on an array of const elements"};
+        }
+
+        if (step.parent.is_volatile() || view.unwrap().element_is_volatile)
+        {
+            return Error{ErrorKind::NotSupported,
+                         "Array::set() on volatile elements is not supported; use get_ref() and as<volatile T>()"};
+        }
+
+        if (value.is_null() || value.descriptor() != element)
+        {
+            return Error{ErrorKind::TypeMismatch,
+                         value.is_null()
+                             ? std::format("Array::set: the value is null, expected '{}'", element->qualified_name)
+                             : std::format("Array::set: the value has type '{}', expected '{}' (types must match "
+                                           "exactly)",
+                                           value.descriptor()->qualified_name, element->qualified_name)};
+        }
+
+        if (element->kind == TypeKind::Array)
+        {
+            return Error{ErrorKind::NotSupported,
+                         std::format("Array::set: the selected element '{}' is itself an array; assign it element by "
+                                     "element",
+                                     element->qualified_name)};
+        }
+
+        if (element->copy_assign == nullptr)
+        {
+            return Error{ErrorKind::NotSupported,
+                         std::format("Array::set: the element type '{}' is not copy-assignable",
+                                     element->qualified_name)};
+        }
+
+        element->copy_assign(element_address(step.parent, step.index), value.raw_data());
+
+        return None{};
+    }
+
+    [[nodiscard]] static auto get_ref_at(ObjectRef array, std::span<const std::size_t> indices) -> Result<ObjectRef, Error>
+    {
+        auto location = locate(array, indices);
+        if (location.is_err())
+        {
+            return location.unwrap_err();
+        }
+
+        return element_ref(location.unwrap().parent, location.unwrap().index);
     }
 };
 
@@ -7001,12 +7178,15 @@ auto enum_box_thunk(std::uint64_t bits) -> void*
 }
 
 /// Whether E can back a dynamically allocated array (E[n]).
+///
+/// An array element type is allowed: `new_instance(class_of<int[3]>(), n)`
+/// allocates `int[n][3]`, which is exactly one dynamic dimension over a static
+/// inner type. The element address arithmetic is the same `index * sizeof(E)`.
 template<typename E>
 consteval auto can_dynamic_array() -> bool
 {
     return std::is_default_constructible_v<E> && std::is_destructible_v<E>
-        && !std::is_array_v<E> && !std::is_reference_v<E>
-        && !std::is_const_v<E> && !std::is_volatile_v<E>;
+        && !std::is_reference_v<E> && !std::is_const_v<E> && !std::is_volatile_v<E>;
 }
 
 /// Byte offset of element 0 inside a dynamic array block (length header + align).
@@ -7050,6 +7230,28 @@ auto dynamic_array_deallocate(void* block) -> void
     }
 }
 
+/// Value-initializes one E at `data`.
+///
+/// An array cannot be placement-new-ed as a single object, so arrays are
+/// initialized element by element (same effect as `E()` for a scalar).
+template<typename E>
+auto value_init_at(void* data) -> void
+{
+    if constexpr (std::is_array_v<E>)
+    {
+        using Element = std::remove_extent_t<E>;
+        char* base = static_cast<char*>(data);
+        for (std::size_t i = 0; i < std::extent_v<E>; ++i)
+        {
+            value_init_at<Element>(base + i * sizeof(Element));
+        }
+    }
+    else
+    {
+        ::new (data) E();
+    }
+}
+
 /// Allocates and default-constructs `count` elements; nullptr when the byte
 /// size (header + count * sizeof(E)) would overflow std::size_t.
 template<typename E, std::size_t Offset>
@@ -7065,7 +7267,7 @@ auto new_array_thunk(std::size_t count) -> void*
     E* elements = reinterpret_cast<E*>(block + Offset);
     for (std::size_t i = 0; i < count; ++i)
     {
-        ::new (static_cast<void*>(elements + i)) E();
+        value_init_at<E>(elements + i);
     }
     return elements;
 }
@@ -7078,7 +7280,7 @@ auto dynamic_array_release(void* data) -> void
     E* elements = static_cast<E*>(data);
     for (std::size_t i = count; i > 0; --i)
     {
-        elements[i - 1].~E();
+        std::destroy_at(elements + i - 1);
     }
     dynamic_array_deallocate<E>(block);
 }
@@ -7110,7 +7312,7 @@ auto dynamic_array_destroy(void* data) -> void
     E* elements = static_cast<E*>(data);
     for (std::size_t i = count; i > 0; --i)
     {
-        elements[i - 1].~E();
+        std::destroy_at(elements + i - 1);
     }
 }
 
@@ -7119,9 +7321,9 @@ template<typename E>
 consteval auto dynamic_array_name(bool simple) -> std::string_view
 {
     constexpr meta::info info = info_of<E>();
-    const std::string_view element = (simple && meta::has_identifier(info))
-        ? std::string_view(meta::identifier_of(info))
-        : std::string_view(meta::display_string_of(info));
+    const std::string element = (simple && meta::has_identifier(info))
+        ? std::string(meta::identifier_of(info))
+        : normalize_type_name(meta::display_string_of(info));
     std::string name(element);
     name += "[]";
     return std::define_static_string(name);
@@ -7819,7 +8021,7 @@ inline constexpr TypeBundle<T> bundle = []() consteval -> TypeBundle<T>
         b.dynamic_array_desc.decayed = std::addressof(bundle<T>.dynamic_array_desc);
         b.dynamic_array_desc.kind = TypeKind::Array;
         b.dynamic_array_desc.element = std::addressof(bundle<T>.desc);
-        b.dynamic_array_desc.array_rank = 1;
+        b.dynamic_array_desc.array_rank = 1 + std::rank_v<T>;
         b.dynamic_array_desc.alignment = alignof(T);
         b.dynamic_array_desc.is_dynamic_array = true;
         b.dynamic_array_desc.array_data_offset = offset;

@@ -95,18 +95,30 @@ int main()
     speculo::Array::set(arr, 2, nine).unwrap();
     std::println("  after set arr[2]={} -> v[2]={}", nine, ints.v[2]);
 
-    // 多维：逐级降维
+    // 多维：一个下标给一维，内部逐级降维
     speculo::ObjectRef matrix = icls.get_field("m").unwrap().get_ref(ints).unwrap();
-    auto row = speculo::Array::get_ref(matrix, 1).unwrap();
-    std::println("  matrix rank={} -> row rank={} m[1][0]={}",
-                 matrix.type().get_array_rank(), row.type().get_array_rank(),
-                 speculo::Array::get(row, 0).unwrap().as<int>().unwrap());
+    std::println("  matrix rank={} length={}x{} m[1][0]={}",
+                 matrix.type().get_array_rank(),
+                 speculo::Array::get_length(matrix).unwrap(),
+                 speculo::Array::get_length(matrix, 1).unwrap(),
+                 speculo::Array::get(matrix, { 1, 0 }).unwrap().as<int>().unwrap());
 
-    // 动态数组（运行期长度）
+    speculo::Array::set(matrix, { 1, 1 }, nine).unwrap();
+    std::println("  after set m[1][1]={}", ints.m[1][1]);
+
+    // 动态数组（运行期长度），元素本身可以是数组：一次分配得到 int[n][3]
     speculo::Object dyn = std::move(speculo::Array::new_instance(speculo::class_of<int>(), 4).unwrap());
     std::println("  dynamic int[4]: length={} is_array={} element={}",
                  speculo::Array::get_length(dyn).unwrap(), dyn.type().is_array(),
                  speculo::Array::get_element_type(dyn).unwrap().get_name());
+
+    speculo::Object rows = std::move(speculo::Array::new_instance(speculo::class_of<int[3]>(), 2).unwrap());
+    speculo::Array::set(rows.ref(), { 1, 2 }, nine).unwrap();
+    std::println("  dynamic int[2][3]: type={} rank={} length={}x{} rows[1][2]={}",
+                 rows.type().get_name(), rows.type().get_array_rank(),
+                 speculo::Array::get_length(rows.ref()).unwrap(),
+                 speculo::Array::get_length(rows.ref(), 1).unwrap(),
+                 speculo::Array::get(rows.ref(), { 1, 2 }).unwrap().as<int>().unwrap());
 
     return 0;
 }

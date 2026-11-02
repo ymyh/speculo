@@ -260,5 +260,6 @@ Args(Ts&... objs)
 - Every API with more than one parameter keeps its **value-class matrix table**
   at the top of the test file (format in @.agents/testing.md §6); the table and
   the cases must stay in sync.
-- Strategy, coverage model and the v2-specific techniques are in
+- The general method is the `contract-tests` skill; the speculo supplement (value
+  classes, matrix budget, error precedence, acceptance) is in
   @.agents/testing.md; the file-to-API map is in `tests/README.md`.

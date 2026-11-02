@@ -23,7 +23,7 @@
 - API 详细设计：@.agents/api_design.md
 - 开发计划：@.agents/phases.md
 - 代码风格：@.agents/codeStyle.md
-- 测试策略：@.agents/testing.md（测试文件清单见 `tests/README.md`）
+- 测试策略：通用方法见 `contract-tests` skill，speculo 的补充见 @.agents/testing.md（测试文件清单见 `tests/README.md`）
 - 审核反馈：@.agents/review.md
 - crab_cpp 依赖 API 偏差与升级适配：@.agents/crab_cpp_api_notes.md
 
@@ -38,8 +38,9 @@
 - 宏单独放普通头文件 `include/speculo/macros.h`（`SPECULO_IMPL` / `SPECULO_IMPL_VIRTUAL` / `SPECULO_REGISTER`），不进模块。
 - 静态反射代码全部是 `consteval`，运行期描述表只生成一次且只读；新增特性时遵循 @.agents/design.md 中的分层架构。
 - **测试不在实现阶段写**：实现只交付 `src/`（必要处加 `static_assert`），`tests/*_test.cpp` 在实现
-  完成后单独用 `speculo-tests` skill 产出——它按 @.agents/testing.md §2–§6 出值类矩阵、逐格断言、
-  分支清单，并同步 `tests/README.md` / `review.md` / `phases.md`。理由见 @.agents/testing.md §0。
+  完成后单独用 `contract-tests` skill 产出，并把 @.agents/testing.md §2–§6 的 speculo 补充（值类记号、
+  格数预算、错误优先级、命名）作为输入；同步 `tests/README.md` / `review.md` / `phases.md`。
+  理由见 @.agents/testing.md §0。
 - 严格遵循 @.agents/codeStyle.md；拿不准时与周围已有代码保持一致。
 - 改动保持最小化，不要顺手重排无关代码。
 

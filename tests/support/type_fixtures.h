@@ -221,4 +221,13 @@ struct PinnedElement
     PinnedElement(const PinnedElement&) = delete;
 };
 
+// Default-constructible and copy-constructible, but not copy-assignable.
+struct NonAssignable
+{
+    int v = 0;
+    NonAssignable() = default;
+    NonAssignable(const NonAssignable&) = default;
+    auto operator=(const NonAssignable&) -> NonAssignable& = delete;
+};
+
 } // namespace

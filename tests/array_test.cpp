@@ -329,7 +329,7 @@ namespace
 
 enum class ObjectForm { Mutable, Const, Volatile, Scalar, Null };
 enum class Operation { Length, Get, Set, GetRef };
-enum class Expected { Ok, NullInstance, TypeMismatch, ReadOnly, NotSupported };
+enum class Expected { Ok, NullInstance, TypeMismatch, ReadOnly, NotSupported, InvalidArgument };
 
 constexpr std::array<ObjectForm, 5> kObjectForms{
     ObjectForm::Mutable,
@@ -390,11 +390,12 @@ constexpr std::array<bool, 5> kElementTypeIsSome{ true, true, true, false, false
 {
     switch (expected)
     {
-        case Expected::Ok:           return speculo::ErrorKind::NotFound;
-        case Expected::NullInstance: return speculo::ErrorKind::NullInstance;
-        case Expected::TypeMismatch: return speculo::ErrorKind::TypeMismatch;
-        case Expected::ReadOnly:     return speculo::ErrorKind::ReadOnly;
-        case Expected::NotSupported: return speculo::ErrorKind::NotSupported;
+        case Expected::Ok:              return speculo::ErrorKind::NotFound;
+        case Expected::NullInstance:    return speculo::ErrorKind::NullInstance;
+        case Expected::TypeMismatch:    return speculo::ErrorKind::TypeMismatch;
+        case Expected::ReadOnly:        return speculo::ErrorKind::ReadOnly;
+        case Expected::NotSupported:    return speculo::ErrorKind::NotSupported;
+        case Expected::InvalidArgument: return speculo::ErrorKind::InvalidArgument;
     }
 
     return speculo::ErrorKind::NotFound;
@@ -492,3 +493,713 @@ TEST(ArrayOperationMatrix, ObjectFormByOperation)
         EXPECT_EQ(speculo::Array::get_element_type(objects[row]).is_some(), kElementTypeIsSome[row]);
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// multi-index: operation × index form
+//
+// A mutable `int[2][3]`; `indices` is partitioned by .agents/testing.md §2
+// (typical / boundary / empty / illegal), the expected kinds follow the check
+// order recorded in .agents/testing.md §5.
+//
+//                 typical | partial      | empty           | too many        | outer OOR       | inner OOR
+// get           | Ok      | NotSupported | InvalidArgument | InvalidArgument | InvalidArgument | InvalidArgument
+// set           | Ok      | NotSupported | InvalidArgument | InvalidArgument | InvalidArgument | InvalidArgument
+// get_ref       | Ok      | Ok           | InvalidArgument | InvalidArgument | InvalidArgument | InvalidArgument
+//
+// `set` passes the row itself for the partial form, so that cell reaches the
+// "an array has no whole-array assignment" check instead of the type check.
+//
+// The three-way product is 3 operations × 6 index forms × 5 object forms = 90 >
+// 64, so it is split into two full two-way matrices (18 + 15 cells) plus the
+// three-way cells that pin the precedence: empty / too-many on scalar and null
+// in `MultiIndexErrorsFollowTheDocumentedOrder`.
+// ─────────────────────────────────────────────────────────────────────────────
+
+namespace
+{
+
+enum class IndexForm { Typical, Partial, Empty, TooMany, OuterOutOfRange, InnerOutOfRange };
+enum class IndexedOperation { Get, Set, GetRef };
+
+constexpr std::array<IndexForm, 6> kIndexForms{
+    IndexForm::Typical,
+    IndexForm::Partial,
+    IndexForm::Empty,
+    IndexForm::TooMany,
+    IndexForm::OuterOutOfRange,
+    IndexForm::InnerOutOfRange,
+};
+
+constexpr std::array<IndexedOperation, 3> kIndexedOperations{
+    IndexedOperation::Get,
+    IndexedOperation::Set,
+    IndexedOperation::GetRef,
+};
+
+// 3 x 6 = 18 cells.
+constexpr std::array<std::array<Expected, 6>, 3> kMultiIndexMatrix{{
+    /* get     */ { Expected::Ok, Expected::NotSupported, Expected::InvalidArgument, Expected::InvalidArgument,
+                    Expected::InvalidArgument, Expected::InvalidArgument },
+    /* set     */ { Expected::Ok, Expected::NotSupported, Expected::InvalidArgument, Expected::InvalidArgument,
+                    Expected::InvalidArgument, Expected::InvalidArgument },
+    /* get_ref */ { Expected::Ok, Expected::Ok, Expected::InvalidArgument, Expected::InvalidArgument,
+                    Expected::InvalidArgument, Expected::InvalidArgument },
+}};
+
+[[nodiscard]] constexpr auto form_name(IndexForm form) -> std::string_view
+{
+    switch (form)
+    {
+        case IndexForm::Typical:         return "typical";
+        case IndexForm::Partial:         return "partial";
+        case IndexForm::Empty:           return "empty";
+        case IndexForm::TooMany:         return "too-many";
+        case IndexForm::OuterOutOfRange: return "outer-oor";
+        case IndexForm::InnerOutOfRange: return "inner-oor";
+    }
+
+    return "?";
+}
+
+[[nodiscard]] constexpr auto operation_name(IndexedOperation operation) -> std::string_view
+{
+    switch (operation)
+    {
+        case IndexedOperation::Get:    return "get";
+        case IndexedOperation::Set:    return "set";
+        case IndexedOperation::GetRef: return "get_ref";
+    }
+
+    return "?";
+}
+
+/// Runs one multi-index operation and normalizes it to "success or the error it reported".
+[[nodiscard]] auto run_indexed(IndexedOperation operation, const speculo::ObjectRef& object,
+                               std::initializer_list<std::size_t> indices, int& nine,
+                               const speculo::ObjectRef& row) -> std::optional<speculo::Error>
+{
+    switch (operation)
+    {
+        case IndexedOperation::Get:
+        {
+            auto result = speculo::Array::get(object, indices);
+            return result.is_ok() ? std::nullopt : std::optional<speculo::Error>(result.unwrap_err());
+        }
+        case IndexedOperation::Set:
+        {
+            const speculo::ObjectRef value = indices.size() == 1 ? row : speculo::ObjectRef(nine);
+            auto result = speculo::Array::set(object, indices, value);
+            return result.is_ok() ? std::nullopt : std::optional<speculo::Error>(result.unwrap_err());
+        }
+        case IndexedOperation::GetRef:
+        {
+            auto result = speculo::Array::get_ref(object, indices);
+            return result.is_ok() ? std::nullopt : std::optional<speculo::Error>(result.unwrap_err());
+        }
+    }
+
+    std::abort();
+}
+
+[[nodiscard]] auto run_form(IndexedOperation operation, const speculo::ObjectRef& object, IndexForm form, int& nine,
+                            const speculo::ObjectRef& row) -> std::optional<speculo::Error>
+{
+    switch (form)
+    {
+        case IndexForm::Typical:         return run_indexed(operation, object, { 1, 2 }, nine, row);
+        case IndexForm::Partial:         return run_indexed(operation, object, { 1 }, nine, row);
+        case IndexForm::Empty:           return run_indexed(operation, object, {}, nine, row);
+        case IndexForm::TooMany:         return run_indexed(operation, object, { 0, 0, 0 }, nine, row);
+        case IndexForm::OuterOutOfRange: return run_indexed(operation, object, { 2, 0 }, nine, row);
+        case IndexForm::InnerOutOfRange: return run_indexed(operation, object, { 0, 3 }, nine, row);
+    }
+
+    std::abort();
+}
+
+[[nodiscard]] auto same(const int (&left)[2][3], const int (&right)[2][3]) -> bool
+{
+    for (std::size_t i = 0; i < 2; ++i)
+    {
+        for (std::size_t j = 0; j < 3; ++j)
+        {
+            if (left[i][j] != right[i][j])
+            {
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
+} // namespace
+
+TEST(ArrayMultiIndexMatrix, OperationByIndexForm)
+{
+    int matrix[2][3] = { { 1, 2, 3 }, { 4, 5, 6 } };
+    speculo::ObjectRef object(matrix);
+    speculo::ObjectRef row(matrix[0]);
+    int nine = 9;
+
+    for (std::size_t r = 0; r < kIndexedOperations.size(); ++r)
+    {
+        for (std::size_t c = 0; c < kIndexForms.size(); ++c)
+        {
+            SCOPED_TRACE(std::format("{}/{}", operation_name(kIndexedOperations[r]), form_name(kIndexForms[c])));
+
+            const Expected expected = kMultiIndexMatrix[r][c];
+            int before[2][3] = {};
+            for (std::size_t i = 0; i < 2; ++i)
+            {
+                for (std::size_t j = 0; j < 3; ++j)
+                {
+                    before[i][j] = matrix[i][j];
+                }
+            }
+
+            const std::optional<speculo::Error> error =
+                run_form(kIndexedOperations[r], object, kIndexForms[c], nine, row);
+
+            if (expected == Expected::Ok)
+            {
+                ASSERT_FALSE(error.has_value());
+                continue;
+            }
+
+            ASSERT_TRUE(error.has_value());
+            EXPECT_EQ(error->kind, expected_kind(expected));
+
+            // A rejected write must not have touched the array.
+            if (kIndexedOperations[r] == IndexedOperation::Set)
+            {
+                EXPECT_TRUE(same(before, matrix));
+            }
+        }
+    }
+
+    EXPECT_EQ(matrix[1][2], 9); // the one successful write
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// multi-index: object form × operation (15 cells), indices {0, 1}
+//
+//                 get          | set          | get_ref
+// mutable 2D    | Ok           | Ok           | Ok
+// const 2D      | Ok           | ReadOnly     | Ok
+// volatile 2D   | NotSupported | NotSupported | Ok
+// scalar        | TypeMismatch | TypeMismatch | TypeMismatch
+// null          | NullInstance | NullInstance | NullInstance
+// ─────────────────────────────────────────────────────────────────────────────
+
+TEST(ArrayMultiIndexMatrix, ObjectFormByOperation)
+{
+    int mutable_2d[2][3] = { { 1, 2, 3 }, { 4, 5, 6 } };
+    static const int const_2d[2][3] = { { 1, 2, 3 }, { 4, 5, 6 } };
+    volatile int volatile_2d[2][3] = { { 1, 2, 3 }, { 4, 5, 6 } };
+    int scalar = 0;
+    int nine = 9;
+
+    constexpr std::array<std::array<Expected, 3>, 5> matrix{{
+        /* mutable  */ { Expected::Ok, Expected::Ok, Expected::Ok },
+        /* const    */ { Expected::Ok, Expected::ReadOnly, Expected::Ok },
+        /* volatile */ { Expected::NotSupported, Expected::NotSupported, Expected::Ok },
+        /* scalar   */ { Expected::TypeMismatch, Expected::TypeMismatch, Expected::TypeMismatch },
+        /* null     */ { Expected::NullInstance, Expected::NullInstance, Expected::NullInstance },
+    }};
+
+    const std::array<speculo::ObjectRef, 5> objects{
+        speculo::ObjectRef(mutable_2d),
+        speculo::ObjectRef(static_cast<const void*>(const_2d), speculo::class_of<const int[2][3]>()),
+        speculo::ObjectRef(volatile_2d),
+        speculo::ObjectRef(scalar),
+        speculo::ObjectRef{},
+    };
+
+    for (std::size_t r = 0; r < kObjectForms.size(); ++r)
+    {
+        for (std::size_t c = 0; c < kIndexedOperations.size(); ++c)
+        {
+            SCOPED_TRACE(std::format("{}/{}", form_name(kObjectForms[r]), operation_name(kIndexedOperations[c])));
+
+            const std::optional<speculo::Error> error =
+                run_indexed(kIndexedOperations[c], objects[r], { 0, 1 }, nine, speculo::ObjectRef{});
+            const Expected expected = matrix[r][c];
+
+            if (expected == Expected::Ok)
+            {
+                ASSERT_FALSE(error.has_value());
+            }
+            else
+            {
+                ASSERT_TRUE(error.has_value());
+                EXPECT_EQ(error->kind, expected_kind(expected));
+            }
+        }
+    }
+
+    EXPECT_EQ(mutable_2d[0][1], 9); // the mutable row's successful write
+
+    // The const row still reads the original value, and views carry the receiver's cv.
+    EXPECT_EQ(speculo::Array::get(objects[1], { 0, 1 }).unwrap().as<int>().unwrap(), 2);
+    EXPECT_TRUE(speculo::Array::get_ref(objects[1], { 0, 1 }).unwrap().is_const());
+    EXPECT_TRUE(speculo::Array::get_ref(objects[2], { 0, 1 }).unwrap().is_volatile());
+    EXPECT_FALSE(speculo::Array::get_ref(objects[0], { 0, 1 }).unwrap().is_const());
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// get_length(array, dimension): object form × dimension (6 × 4 = 24 cells)
+//
+//                 0              | 1              | 2               | 99
+// 2D mutable    | Ok(2)          | Ok(3)          | InvalidArgument | InvalidArgument
+// 2D const      | Ok(2)          | Ok(3)          | InvalidArgument | InvalidArgument
+// 2D volatile   | Ok(2)          | Ok(3)          | InvalidArgument | InvalidArgument
+// 1D mutable    | Ok(3)          | InvalidArgument | InvalidArgument | InvalidArgument
+// scalar        | TypeMismatch   | TypeMismatch   | TypeMismatch    | TypeMismatch
+// null          | NullInstance   | NullInstance   | NullInstance    | NullInstance
+// ─────────────────────────────────────────────────────────────────────────────
+
+namespace
+{
+
+enum class LengthForm { TwoDimMutable, TwoDimConst, TwoDimVolatile, OneDimMutable, Scalar, Null };
+
+struct LengthCell
+{
+    Expected    expected = Expected::Ok;
+    std::size_t length = 0; ///< meaningful only when expected == Ok
+};
+
+constexpr std::array<LengthForm, 6> kLengthForms{
+    LengthForm::TwoDimMutable,
+    LengthForm::TwoDimConst,
+    LengthForm::TwoDimVolatile,
+    LengthForm::OneDimMutable,
+    LengthForm::Scalar,
+    LengthForm::Null,
+};
+
+constexpr std::array<std::size_t, 4> kDimensions{ 0, 1, 2, 99 };
+
+// 6 x 4 = 24 cells; columns are dimension 0 / 1 / 2 / 99.
+constexpr LengthCell kLengthMatrix[6][4] = {
+    /* 2D mutable  */ { { Expected::Ok, 2 }, { Expected::Ok, 3 }, { Expected::InvalidArgument, 0 },
+                        { Expected::InvalidArgument, 0 } },
+    /* 2D const    */ { { Expected::Ok, 2 }, { Expected::Ok, 3 }, { Expected::InvalidArgument, 0 },
+                        { Expected::InvalidArgument, 0 } },
+    /* 2D volatile */ { { Expected::Ok, 2 }, { Expected::Ok, 3 }, { Expected::InvalidArgument, 0 },
+                        { Expected::InvalidArgument, 0 } },
+    /* 1D mutable  */ { { Expected::Ok, 3 }, { Expected::InvalidArgument, 0 }, { Expected::InvalidArgument, 0 },
+                        { Expected::InvalidArgument, 0 } },
+    /* scalar      */ { { Expected::TypeMismatch, 0 }, { Expected::TypeMismatch, 0 },
+                        { Expected::TypeMismatch, 0 }, { Expected::TypeMismatch, 0 } },
+    /* null        */ { { Expected::NullInstance, 0 }, { Expected::NullInstance, 0 },
+                        { Expected::NullInstance, 0 }, { Expected::NullInstance, 0 } },
+};
+
+[[nodiscard]] constexpr auto length_form_name(LengthForm form) -> std::string_view
+{
+    switch (form)
+    {
+        case LengthForm::TwoDimMutable:  return "2d-mutable";
+        case LengthForm::TwoDimConst:    return "2d-const";
+        case LengthForm::TwoDimVolatile: return "2d-volatile";
+        case LengthForm::OneDimMutable:  return "1d-mutable";
+        case LengthForm::Scalar:         return "scalar";
+        case LengthForm::Null:           return "null";
+    }
+
+    return "?";
+}
+
+} // namespace
+
+TEST(ArrayLengthMatrix, ObjectFormByDimension)
+{
+    int mutable_2d[2][3] = { { 1, 2, 3 }, { 4, 5, 6 } };
+    static const int const_2d[2][3] = { { 1, 2, 3 }, { 4, 5, 6 } };
+    volatile int volatile_2d[2][3] = { { 1, 2, 3 }, { 4, 5, 6 } };
+    int one_dim[3] = { 1, 2, 3 };
+    int scalar = 0;
+
+    const std::array<speculo::ObjectRef, 6> objects{
+        speculo::ObjectRef(mutable_2d),
+        speculo::ObjectRef(static_cast<const void*>(const_2d), speculo::class_of<const int[2][3]>()),
+        speculo::ObjectRef(volatile_2d),
+        speculo::ObjectRef(one_dim),
+        speculo::ObjectRef(scalar),
+        speculo::ObjectRef{},
+    };
+
+    for (std::size_t r = 0; r < kLengthForms.size(); ++r)
+    {
+        for (std::size_t c = 0; c < kDimensions.size(); ++c)
+        {
+            SCOPED_TRACE(std::format("{}/dim {}", length_form_name(kLengthForms[r]), kDimensions[c]));
+
+            const LengthCell cell = kLengthMatrix[r][c];
+            const auto result = speculo::Array::get_length(objects[r], kDimensions[c]);
+
+            if (cell.expected == Expected::Ok)
+            {
+                ASSERT_TRUE(result.is_ok());
+                EXPECT_EQ(result.unwrap(), cell.length);
+            }
+            else
+            {
+                ASSERT_TRUE(result.is_err());
+                EXPECT_EQ(result.unwrap_err().kind, expected_kind(cell.expected));
+            }
+        }
+    }
+
+    // Dimension 0 is the one-argument form, and the outermost length stays the
+    // same however deep the object is.
+    EXPECT_EQ(speculo::Array::get_length(objects[0], 0).unwrap(), speculo::Array::get_length(objects[0]).unwrap());
+    EXPECT_EQ(speculo::Array::get_length(objects[3], 0).unwrap(), 3u);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// multi-index single cases: values, sub-array views, error precedence
+// ─────────────────────────────────────────────────────────────────────────────
+
+TEST(ArrayTest, MultiIndexReadsAndWritesEveryDimension)
+{
+    int cube[2][2][2] = { { { 1, 2 }, { 3, 4 } }, { { 5, 6 }, { 7, 8 } } };
+    speculo::ObjectRef object(cube);
+
+    EXPECT_EQ(object.type().get_array_rank(), 3u);
+    EXPECT_EQ(speculo::Array::get_length(object).unwrap(), 2u);
+    EXPECT_EQ(speculo::Array::get_length(object, 1).unwrap(), 2u);
+    EXPECT_EQ(speculo::Array::get_length(object, 2).unwrap(), 2u);
+
+    EXPECT_EQ(speculo::Array::get(object, { 1, 0, 1 }).unwrap().as<int>().unwrap(), 6);
+
+    int nine = 9;
+    EXPECT_TRUE(speculo::Array::set(object, { 0, 1, 0 }, nine).is_ok());
+    EXPECT_EQ(cube[0][1][0], 9);
+
+    // A partial index selects a sub-array: index it again, or view it natively.
+    auto plane = speculo::Array::get_ref(object, { 1 }).unwrap();
+    EXPECT_EQ(plane.type(), speculo::class_of<int[2][2]>());
+    auto row = speculo::Array::get_ref(plane, { 1 }).unwrap();
+    EXPECT_EQ(row.type(), speculo::class_of<int[2]>());
+    EXPECT_EQ(speculo::Array::get(row, { 0 }).unwrap().as<int>().unwrap(), 7);
+    EXPECT_EQ(row.as<int[2]>().unwrap()[1], 8);
+
+    // A sub-array is still a view at this depth: neither boxable nor assignable.
+    EXPECT_EQ(speculo::Array::get(object, { 1 }).unwrap_err().kind, speculo::ErrorKind::NotSupported);
+    EXPECT_EQ(speculo::Array::set(object, { 1 }, plane).unwrap_err().kind, speculo::ErrorKind::NotSupported);
+    EXPECT_EQ(speculo::Array::get(object, { 1, 1, 1, 1 }).unwrap_err().kind,
+              speculo::ErrorKind::InvalidArgument);
+}
+
+TEST(ArrayTest, MultiIndexMatchesChainedSingleIndexing)
+{
+    int matrix[2][3] = { { 1, 2, 3 }, { 4, 5, 6 } };
+    speculo::ObjectRef object(matrix);
+    auto row = speculo::Array::get_ref(object, 1).unwrap();
+
+    EXPECT_EQ(speculo::Array::get(object, { 1, 2 }).unwrap().as<int>().unwrap(),
+              speculo::Array::get(row, 2).unwrap().as<int>().unwrap());
+
+    int nine = 9;
+    EXPECT_TRUE(speculo::Array::set(object, { 1, 2 }, nine).is_ok());
+    EXPECT_EQ(speculo::Array::get(row, 2).unwrap().as<int>().unwrap(), 9);
+
+    // get_ref agrees with the single-index form at the same coordinates.
+    EXPECT_EQ(speculo::Array::get_ref(object, { 1, 1 }).unwrap().as<int>().unwrap(),
+              speculo::Array::get_ref(row, 1).unwrap().as<int>().unwrap());
+}
+
+TEST(ArrayTest, MultiIndexCvQualifiersFlowDownTheChain)
+{
+    static const int const_2d[2][3] = { { 1, 2, 3 }, { 4, 5, 6 } };
+    volatile int volatile_2d[2][3] = { { 1, 2, 3 }, { 4, 5, 6 } };
+    int nine = 9;
+
+    const speculo::ObjectRef const_object(static_cast<const void*>(const_2d), speculo::class_of<const int[2][3]>());
+    EXPECT_EQ(speculo::Array::get(const_object, { 1, 2 }).unwrap().as<int>().unwrap(), 6);
+
+    auto element = speculo::Array::get_ref(const_object, { 0, 2 }).unwrap();
+    EXPECT_TRUE(element.is_const());
+    EXPECT_EQ(element.as<const int>().unwrap(), 3);
+    EXPECT_TRUE(element.as<int>().is_none());
+
+    auto row = speculo::Array::get_ref(const_object, { 1 }).unwrap();
+    EXPECT_TRUE(row.is_const());
+    EXPECT_TRUE(row.as<const int[3]>().is_some());
+    EXPECT_EQ(speculo::Array::set(row, { 0 }, nine).unwrap_err().kind, speculo::ErrorKind::ReadOnly);
+    EXPECT_EQ(speculo::Array::set(const_object, { 1, 0 }, nine).unwrap_err().kind, speculo::ErrorKind::ReadOnly);
+
+    const speculo::ObjectRef volatile_object(volatile_2d);
+    EXPECT_EQ(speculo::Array::get(volatile_object, { 0, 0 }).unwrap_err().kind, speculo::ErrorKind::NotSupported);
+    EXPECT_EQ(speculo::Array::set(volatile_object, { 0, 0 }, nine).unwrap_err().kind,
+              speculo::ErrorKind::NotSupported);
+
+    auto volatile_element = speculo::Array::get_ref(volatile_object, { 0, 0 }).unwrap();
+    EXPECT_TRUE(volatile_element.is_volatile());
+    EXPECT_EQ(volatile_element.as<volatile int>().unwrap(), 1);
+    EXPECT_TRUE(speculo::Array::get_ref(volatile_object, { 0 }).unwrap().is_volatile());
+}
+
+TEST(ArrayTest, MultiIndexErrorsFollowTheDocumentedOrder)
+{
+    int matrix[2][3] = { { 1, 2, 3 }, { 4, 5, 6 } };
+    int flat[3] = { 1, 2, 3 };
+    int scalar = 0;
+    speculo::ObjectRef object(matrix);
+    speculo::ObjectRef flat_object(flat);
+    speculo::ObjectRef scalar_object(scalar);
+    speculo::ObjectRef null_object{};
+
+    // The receiver is validated before the index list.
+    EXPECT_EQ(speculo::Array::get(null_object, {}).unwrap_err().kind, speculo::ErrorKind::NullInstance);
+    EXPECT_EQ(speculo::Array::get(scalar_object, {}).unwrap_err().kind, speculo::ErrorKind::TypeMismatch);
+    EXPECT_EQ(speculo::Array::get(null_object, { 0, 0, 0 }).unwrap_err().kind,
+              speculo::ErrorKind::NullInstance);
+    EXPECT_EQ(speculo::Array::get(scalar_object, { 0, 0, 0 }).unwrap_err().kind,
+              speculo::ErrorKind::TypeMismatch);
+
+    // Rank before range: too many indices cannot reach an element.
+    EXPECT_EQ(speculo::Array::get(object, { 0, 0, 0 }).unwrap_err().kind, speculo::ErrorKind::InvalidArgument);
+    EXPECT_EQ(speculo::Array::get(flat_object, { 0, 0 }).unwrap_err().kind, speculo::ErrorKind::InvalidArgument);
+    EXPECT_EQ(speculo::Array::get_ref(flat_object, { 0, 0 }).unwrap_err().kind,
+              speculo::ErrorKind::InvalidArgument);
+    EXPECT_EQ(speculo::Array::get(flat_object, { 0 }).unwrap().as<int>().unwrap(), 1);
+
+    // Range before capability: an out-of-range index wins over "not copyable".
+    EXPECT_EQ(speculo::Array::get(object, { 0, 3 }).unwrap_err().kind, speculo::ErrorKind::InvalidArgument);
+    EXPECT_EQ(speculo::Array::get(object, { 2, 0 }).unwrap_err().kind, speculo::ErrorKind::InvalidArgument);
+
+    // A row is a view, not a value: readable by reference, not by value.
+    EXPECT_TRUE(speculo::Array::get_ref(object, { 0 }).is_ok());
+    EXPECT_EQ(speculo::Array::get(object, { 0 }).unwrap_err().kind, speculo::ErrorKind::NotSupported);
+}
+
+TEST(ArrayTest, MultiIndexSetChecksTheValueForm)
+{
+    int matrix[2][3] = { { 1, 2, 3 }, { 4, 5, 6 } };
+    static const int const_2d[2][3] = { { 1, 2, 3 }, { 4, 5, 6 } };
+    speculo::ObjectRef object(matrix);
+    speculo::ObjectRef row(matrix[0]);
+    int nine = 9;
+
+    // The value is checked before the element kind: a row value reaches the
+    // array check, a scalar or a null value stops at the type check.
+    EXPECT_EQ(speculo::Array::set(object, { 0 }, row).unwrap_err().kind, speculo::ErrorKind::NotSupported);
+    EXPECT_EQ(speculo::Array::set(object, { 0 }, nine).unwrap_err().kind, speculo::ErrorKind::TypeMismatch);
+    EXPECT_EQ(speculo::Array::set(object, { 0 }, speculo::ObjectRef{}).unwrap_err().kind,
+              speculo::ErrorKind::TypeMismatch);
+
+    // A const receiver is refused before any index or value is looked at.
+    const speculo::ObjectRef const_object(static_cast<const void*>(const_2d), speculo::class_of<const int[2][3]>());
+    EXPECT_EQ(speculo::Array::set(const_object, { 9, 9 }, nine).unwrap_err().kind, speculo::ErrorKind::ReadOnly);
+    EXPECT_EQ(speculo::Array::set(const_object, {}, nine).unwrap_err().kind, speculo::ErrorKind::ReadOnly);
+}
+
+TEST(ArrayTest, MultiIndexValueCapabilities)
+{
+    PinnedElement pinned[2];
+    NonAssignable items[2];
+    NonAssignable value;
+
+    // Elements that cannot be copied are readable by reference only.
+    EXPECT_EQ(speculo::Array::get(speculo::ObjectRef(pinned), { 0 }).unwrap_err().kind,
+              speculo::ErrorKind::NotSupported);
+    EXPECT_TRUE(speculo::Array::get_ref(speculo::ObjectRef(pinned), { 0 }).is_ok());
+
+    // Elements that cannot be assigned are writable by reference only.
+    EXPECT_EQ(speculo::Array::set(speculo::ObjectRef(items), { 0 }, value).unwrap_err().kind,
+              speculo::ErrorKind::NotSupported);
+    EXPECT_TRUE(speculo::Array::get_ref(speculo::ObjectRef(items), { 0 }).is_ok());
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// dynamic arrays of arrays
+// ─────────────────────────────────────────────────────────────────────────────
+
+TEST(ArrayTest, DynamicArrayOfArraysIsAMultiDimensionalArray)
+{
+    auto made = speculo::Array::new_instance(speculo::class_of<int[3]>(), 2);
+    ASSERT_TRUE(made.is_ok());
+    speculo::Object rows = std::move(made).unwrap();
+    speculo::ObjectRef object = rows.ref();
+
+    EXPECT_TRUE(object.type().is_array());
+    EXPECT_EQ(object.type().get_name(), "int[3][]");
+    EXPECT_EQ(object.type().get_qualified_name(), "int[3][]");
+    EXPECT_EQ(object.type().get_array_rank(), 2u);
+    EXPECT_TRUE(object.type().get_array_extent().is_none());
+    EXPECT_FALSE(object.type().has_canonical_name());
+    EXPECT_EQ(speculo::Array::get_element_type(object).unwrap(), speculo::class_of<int[3]>());
+
+    // One runtime dimension over the element's static extents.
+    EXPECT_EQ(speculo::Array::get_length(object).unwrap(), 2u);
+    EXPECT_EQ(speculo::Array::get_length(object, 0).unwrap(), 2u);
+    EXPECT_EQ(speculo::Array::get_length(object, 1).unwrap(), 3u);
+    EXPECT_EQ(speculo::Array::get_length(object, 2).unwrap_err().kind, speculo::ErrorKind::InvalidArgument);
+
+    // A zero-length dynamic array keeps the inner extent.
+    auto empty = speculo::Array::new_instance(speculo::class_of<int[3]>(), 0);
+    ASSERT_TRUE(empty.is_ok());
+    speculo::Object empty_array = std::move(empty).unwrap();
+    EXPECT_EQ(speculo::Array::get_length(empty_array.ref()).unwrap(), 0u);
+    EXPECT_EQ(speculo::Array::get_length(empty_array.ref(), 1).unwrap(), 3u);
+
+    // The dynamic class is a display name only: it is never registered.
+    speculo::register_class(object.type());
+    EXPECT_TRUE(speculo::Class::for_name("int[3][]").is_none());
+
+    // An array is not copy-constructible, so the whole dynamic array cannot be cloned.
+    EXPECT_EQ(rows.clone().unwrap_err().kind, speculo::ErrorKind::NotSupported);
+}
+
+TEST(ArrayTest, DynamicArrayOfArraysIndexesRowsAndElements)
+{
+    auto made = speculo::Array::new_instance(speculo::class_of<int[3]>(), 2);
+    ASSERT_TRUE(made.is_ok());
+    speculo::Object rows = std::move(made).unwrap();
+    speculo::ObjectRef object = rows.ref();
+    int nine = 9;
+
+    EXPECT_TRUE(speculo::Array::set(object, { 1, 2 }, nine).is_ok());
+    EXPECT_EQ(speculo::Array::get(object, { 1, 2 }).unwrap().as<int>().unwrap(), 9);
+    EXPECT_EQ(speculo::Array::get(object, { 0, 0 }).unwrap().as<int>().unwrap(), 0); // value-initialized
+
+    // A row is a view: index it, or see it as a native array.
+    auto row = speculo::Array::get_ref(object, { 1 }).unwrap();
+    EXPECT_EQ(row.type(), speculo::class_of<int[3]>());
+    EXPECT_EQ(speculo::Array::get_length(row).unwrap(), 3u);
+    EXPECT_EQ(row.as<int[3]>().unwrap()[2], 9);
+    row.as<int[3]>().unwrap()[0] = 7;
+    EXPECT_EQ(speculo::Array::get(object, { 1, 0 }).unwrap().as<int>().unwrap(), 7);
+
+    // The row itself cannot be boxed, and the rank is the dynamic one.
+    EXPECT_EQ(speculo::Array::get(object, { 1 }).unwrap_err().kind, speculo::ErrorKind::NotSupported);
+    EXPECT_EQ(speculo::Array::get(object, { 0, 0, 0 }).unwrap_err().kind, speculo::ErrorKind::InvalidArgument);
+    EXPECT_EQ(speculo::Array::get(object, { 2, 0 }).unwrap_err().kind, speculo::ErrorKind::InvalidArgument);
+}
+
+TEST(ArrayTest, DynamicArrayOfArraysConstructsAndDestroysEveryElement)
+{
+    Tracked::alive = 0;
+    {
+        auto made = speculo::Array::new_instance(speculo::class_of<Tracked[2]>(), 3);
+        ASSERT_TRUE(made.is_ok());
+        speculo::Object rows = std::move(made).unwrap();
+        EXPECT_EQ(Tracked::alive, 6); // 3 rows x 2 elements
+
+        Tracked value(5);
+        EXPECT_TRUE(speculo::Array::set(rows.ref(), { 2, 1 }, value).is_ok());
+        EXPECT_EQ(speculo::Array::get(rows.ref(), { 2, 1 }).unwrap().as<Tracked>().unwrap().v, 5);
+    }
+    EXPECT_EQ(Tracked::alive, 0); // every element of every row was destroyed
+}
+
+TEST(ArrayTest, DynamicArrayOfArraysRejectsUnsupportedElementTypes)
+{
+    EXPECT_EQ(speculo::Array::new_instance(speculo::class_of<const int[3]>(), 2).unwrap_err().kind,
+              speculo::ErrorKind::NotSupported);
+    EXPECT_EQ(speculo::Array::new_instance(speculo::class_of<volatile int[3]>(), 2).unwrap_err().kind,
+              speculo::ErrorKind::NotSupported);
+    EXPECT_EQ(speculo::Array::new_instance(speculo::class_of<NoDefault[2]>(), 2).unwrap_err().kind,
+              speculo::ErrorKind::NotSupported);
+    EXPECT_EQ(speculo::Array::new_instance(speculo::class_of<int(&)[3]>(), 2).unwrap_err().kind,
+              speculo::ErrorKind::NotSupported);
+    EXPECT_EQ(speculo::Array::new_instance(speculo::class_of<int[]>(), 2).unwrap_err().kind,
+              speculo::ErrorKind::NotSupported);
+}
+
+TEST(ArrayTest, DynamicArrayOfThreeDimensions)
+{
+    auto made = speculo::Array::new_instance(speculo::class_of<int[2][3]>(), 2);
+    ASSERT_TRUE(made.is_ok());
+    speculo::Object cube = std::move(made).unwrap();
+    speculo::ObjectRef object = cube.ref();
+
+    EXPECT_EQ(object.type().get_array_rank(), 3u);
+    EXPECT_EQ(speculo::Array::get_length(object).unwrap(), 2u);
+    EXPECT_EQ(speculo::Array::get_length(object, 1).unwrap(), 2u);
+    EXPECT_EQ(speculo::Array::get_length(object, 2).unwrap(), 3u);
+    EXPECT_EQ(speculo::Array::get_length(object, 3).unwrap_err().kind, speculo::ErrorKind::InvalidArgument);
+    EXPECT_EQ(speculo::Array::get_element_type(object).unwrap(), speculo::class_of<int[2][3]>());
+
+    int nine = 9;
+    EXPECT_TRUE(speculo::Array::set(object, { 1, 0, 2 }, nine).is_ok());
+    EXPECT_EQ(speculo::Array::get(object, { 1, 0, 2 }).unwrap().as<int>().unwrap(), 9);
+    EXPECT_EQ(speculo::Array::get(object, { 0, 0, 0 }).unwrap().as<int>().unwrap(), 0);
+
+    EXPECT_EQ(speculo::Array::get(object, { 1, 0 }).unwrap_err().kind, speculo::ErrorKind::NotSupported);
+    EXPECT_EQ(speculo::Array::get(object, { 0, 0, 0, 0 }).unwrap_err().kind, speculo::ErrorKind::InvalidArgument);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Array::new_instance(element, length): element form × length (6 × 3 = 18 cells)
+//
+// The element is validated before the length, so a rejected element type
+// reports NotSupported for every length; a valid one reports InvalidArgument
+// only when `Offset + length * sizeof(E)` would overflow.
+//
+//                  0            | typical      | overflowing
+// int             | Ok           | Ok           | InvalidArgument
+// int[3]          | Ok           | Ok           | InvalidArgument
+// const int[3]    | NotSupported | NotSupported | NotSupported
+// NoDefault[2]    | NotSupported | NotSupported | NotSupported
+// int(&)[3]       | NotSupported | NotSupported | NotSupported
+// int[]           | NotSupported | NotSupported | NotSupported
+// ─────────────────────────────────────────────────────────────────────────────
+
+TEST(ArrayNewInstanceMatrix, ElementFormByLength)
+{
+    constexpr std::size_t max = std::numeric_limits<std::size_t>::max();
+    constexpr std::array<std::array<Expected, 3>, 6> expected{{
+        /* int          */ { Expected::Ok, Expected::Ok, Expected::InvalidArgument },
+        /* int[3]       */ { Expected::Ok, Expected::Ok, Expected::InvalidArgument },
+        /* const int[3] */ { Expected::NotSupported, Expected::NotSupported, Expected::NotSupported },
+        /* NoDefault[2] */ { Expected::NotSupported, Expected::NotSupported, Expected::NotSupported },
+        /* int(&)[3]    */ { Expected::NotSupported, Expected::NotSupported, Expected::NotSupported },
+        /* int[]        */ { Expected::NotSupported, Expected::NotSupported, Expected::NotSupported },
+    }};
+
+    const std::array<const speculo::Class*, 6> elements{
+        &speculo::class_of<int>(),
+        &speculo::class_of<int[3]>(),
+        &speculo::class_of<const int[3]>(),
+        &speculo::class_of<NoDefault[2]>(),
+        &speculo::class_of<int(&)[3]>(),
+        &speculo::class_of<int[]>(),
+    };
+    const std::array<std::size_t, 6> element_sizes{ sizeof(int), sizeof(int[3]), 0, 0, 0, 0 };
+    const std::array<std::string_view, 6> names{ "int", "int[3]", "const int[3]", "NoDefault[2]", "int(&)[3]",
+                                                 "int[]" };
+    const std::array<std::string_view, 3> length_names{ "zero", "typical", "overflowing" };
+
+    for (std::size_t r = 0; r < elements.size(); ++r)
+    {
+        for (std::size_t c = 0; c < length_names.size(); ++c)
+        {
+            SCOPED_TRACE(std::format("{}/{}", names[r], length_names[c]));
+
+            const std::size_t length = c == 0 ? 0
+                : c == 1 ? 3
+                : (element_sizes[r] == 0 ? 1 : max / element_sizes[r] + 1);
+
+            auto made = speculo::Array::new_instance(*elements[r], length);
+            const Expected want = expected[r][c];
+
+            if (want == Expected::Ok)
+            {
+                ASSERT_TRUE(made.is_ok());
+                speculo::Object array = std::move(made).unwrap();
+                EXPECT_EQ(speculo::Array::get_length(array.ref()).unwrap(), length);
+            }
+            else
+            {
+                ASSERT_TRUE(made.is_err());
+                EXPECT_EQ(made.unwrap_err().kind, expected_kind(want));
+            }
+        }
+    }
+}
+

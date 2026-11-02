@@ -227,9 +227,11 @@ speculo/
    但 `new_instance` / `construct_at` 必然返回 `NotSupported`——构造函数在命名空间作用域被 `new`
    调用，那里没有类内访问权，`= delete` 与访问受限在反射里是同一种「不可调用」。要动态构造这类
    类型，请提供一个 public 工厂函数并 `function_of` 点名它。
-11. **`Array::new_instance` 的元素不能是数组**：`Array::new_instance(class_of<int[3]>(), n)` 返回
-   `NotSupported`。动态数组的元素地址算术与「元素本身还有自己的 `new_array`」两套语义会互相纠缠，
-   而真实需求几乎总是「一维动态数组」。需要多维时用一维动态数组 + 手工索引，或把元素包一层结构体。
+11. **`Array::new_instance` 的元素可以是数组**：`Array::new_instance(class_of<int[3]>(), n)` 分配 `int[n][3]`。
+   动态数组的 `array_rank` 是 `1 + rank(E)`；第 0 维长度来自分配头（`Array::get_length(dyn)`），
+   其余维度取元素的静态 extent（`Array::get_length(dyn, 1)`）。元素地址算术仍是 `index * sizeof(E)`。
+   元素仍须可默认构造、可析构、不带顶层 cv、不是引用；值为数组时整个动态数组不可 `clone`
+   （数组不能拷贝构造）。数组元素逐个值初始化（`value_init_at`），销毁走 `std::destroy_at`。
 
 ---
 

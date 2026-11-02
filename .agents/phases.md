@@ -233,8 +233,10 @@ Phase 9 又加了 `Callable::invoke` 的接收者 × 实参表，Phase 10 加了
     已把「带 `{aka}` 的查询名归一化」钉住，无需改实现
   - 私有/保护构造函数仍不可 `new_instance`：命名空间作用域 `new` 无类内访问权，**已在
     @.agents/design.md §11 与 `README.md`「Limits」写死**为已知限制
-  - `Array::new_instance` 不支持「元素本身是数组」（`int[3][]`）：记为**已知限制**
-    （@.agents/design.md §11 + `README.md`「Limits」）
+  - `Array` 支持逐维下标与多维动态数组：`get` / `get_ref` / `set(array, {i, j, ...})`、
+    `get_length(array, dimension)`；`Array::new_instance(class_of<int[3]>(), n)` 得到 `int[n][3]`
+    （rank = `1 + rank(E)`，见 @.agents/design.md §11 第 11 条与 `README.md`「Arrays」；
+    测试见 `tests/array_test.cpp` 的三张 `Array*Matrix` 与多维用例）
 - [x] 文档终审：design.md / api_design.md / phases.md 与实现逐条对齐；`review.md` 补「Phase 8–13」
 - [x] `examples/06_proxy_demo.cpp`（[ngcpp/proxy](https://github.com/ngcpp/proxy) 4.1.0 集成，
   构建系统双份依赖声明；原清单里的 `SECONDARY` 是遗留笔误，已删除）

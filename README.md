@@ -109,7 +109,7 @@ The macros live in a normal header. They cannot be exported from the module.
 | `Method` | `invoke` (boxes a copy of the return value) and `invoke_ref` (for reference returns) |
 | `Constructor` | `new_instance` on the heap, or `construct_at` into storage you own |
 | `Object` / `ObjectRef` | An owned value, and a non-owning view of one. `ObjectRef` carries no reference type |
-| `Array` | Index a `T[N]`, or allocate a runtime-length array with `Array::new_instance` |
+| `Array` | Index a `T[N]` (one index per dimension), or allocate a runtime-length array with `Array::new_instance` |
 | `Annotation` | One `[[= expr]]` value attached to a class, member, enumerator, base, or parameter |
 | `Modifier` | The access and qualifier bits (`public`, `const`, `virtual`, `noexcept`, …) |
 
@@ -142,6 +142,35 @@ A by-value parameter is copied from the object you pass. An rvalue-reference par
 `invoke` returns an owning `Object`. `as<T>()` gives a reference to the value inside it when the type matches. `take<T>()` moves the value out. Types that are not copyable cannot be boxed; `get` and `invoke` then return `NotSupported`, and `get_ref` / `invoke_ref` are the way to reach the object.
 
 `cast_to` only walks up public bases. Down-casts and cross-casts need RTTI, which this library does not use.
+
+## Arrays
+
+`class_of<int[2][3]>()` reports `get_array_rank() == 2`, `get_array_extent() == 2`, and `get_element_type() == class_of<int[3]>()`, which answers the same questions one level down. The rank and every static extent belong to the type; only an outer dynamic dimension has a per-object length.
+
+`Array` takes either a single index or one index per dimension, and walks the sub-arrays itself:
+
+```cpp
+speculo::ObjectRef matrix = cls.get_field("m").unwrap().get_ref(obj).unwrap();
+
+speculo::Array::get_length(matrix);        // 2, the outermost length
+speculo::Array::get_length(matrix, 1);     // 3, one level in
+int nine = 9;
+speculo::Array::set(matrix, { 1, 0 }, nine);
+speculo::Array::get(matrix, { 1, 0 });     // a boxed int
+speculo::Array::get_ref(matrix, { 1, 0 }); // a view of that int
+```
+
+`get_length(array)` is the outermost length; `get_length(array, dimension)` counts from the outside. An empty index list, more indices than the rank, or a dimension past the rank is `InvalidArgument`.
+
+A sub-array is a view, never a value. `Array::get(matrix, { 0 })` is `NotSupported`, because an array is not copy-constructible and a row cannot be boxed; `get_ref` instead returns a handle of type `int[3]` that can be indexed again, or viewed as a native array with `as<int[3]>()`. The same language rule is why a row cannot be assigned as a whole: `set` on a sub-array is `NotSupported`, so write it element by element.
+
+`const` and `volatile` flow down the chain: every level of a `const int[2][3]` is read-only, and volatile elements are reachable only through `get_ref` and `as<volatile T>()`.
+
+`Array::new_instance` allocates a runtime-length array. The element type may itself be an array, which gives one dynamic dimension over static inner extents:
+
+```cpp
+speculo::Array::new_instance(speculo::class_of<int[3]>(), 4);   // int[4][3], rank 2
+```
 
 ## Standard-library types
 
@@ -231,7 +260,7 @@ An override is matched by the C++ rule: same name, same parameter types (exactly
 - The project builds with `-fno-exceptions`. A reflected function that throws has undefined behavior.
 - Derived-class and overrider queries cover registered types only (see [Type graph](#type-graph)).
 - A private or protected constructor is listed by `get_declared_constructors()` but cannot be called: `new_instance` / `construct_at` return `NotSupported`, because construction happens at namespace scope, where class access does not apply. Expose a public factory function and use `function_of` instead.
-- `Array::new_instance` refuses an array element type (`int[3]`): the element has to be default-constructible, destructible and an object type. Use a one-dimensional dynamic array and index it yourself.
+- `Array::new_instance` needs an element type that is default-constructible, destructible, not cv-qualified and not a reference. An array element type is allowed: `new_instance(class_of<int[3]>(), n)` makes `int[n][3]`, whose rank is 2 and whose inner length is static.
 - There is no `get_vtable_index()`: GCC 16.2's `<meta>` reports `is_virtual` / `is_pure_virtual` / `is_override` but no slot number, and a real slot number would require the Itanium ABI's private vtable layout.
 
 ## Examples

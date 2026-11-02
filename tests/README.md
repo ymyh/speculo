@@ -4,9 +4,10 @@ Test sources are grouped by the public API they exercise, not by the development
 phase that introduced them. Add a test to the file that matches its feature; a new
 feature normally gets a new `*_test.cpp` file.
 
-How to write, run and judge tests (layers, per-API coverage matrix, assertion
-discipline, v2 techniques) is documented in @.agents/testing.md — this file only
-lists what exists.
+The general method (contract → partitions → combinations → assertions → coverage
+ledger) is the `contract-tests` skill. The speculo-specific supplement — layers,
+value classes, matrix budget, error precedence, naming, run commands, acceptance —
+is in @.agents/testing.md. This file only lists what exists.
 
 Files that carry a **value-class matrix** keep the expected-result table in a
 comment above the loop, and every cell of the product is asserted:
@@ -18,6 +19,9 @@ comment above the loop, and every cell of the product is asserted:
 | `ClassMethodLookupMatrix` | `class_test.cpp` | lookup way × target (5 × 4) |
 | `ConstructorNewInstanceMatrix` | `constructor_test.cpp` | constructor set × argument form (5 × 5) |
 | `ArrayOperationMatrix` | `array_test.cpp` | object form × operation (5 × 4 + the `Option` column) |
+| `ArrayMultiIndexMatrix` | `array_test.cpp` | operation × index form (3 × 6); object form × operation (5 × 3) |
+| `ArrayLengthMatrix` | `array_test.cpp` | object form × dimension (6 × 4) |
+| `ArrayNewInstanceMatrix` | `array_test.cpp` | element form × length (6 × 3) |
 | `CastMatrix` | `inheritance_test.cpp` | target base × receiver constness (5 × 2) |
 | `EnumConversionMatrix` | `enumerator_test.cpp` | enum × conversion (4 × 6) |
 | `CallableInvokeMatrix` | `callable_test.cpp` | receiver form × argument form (4 × 3, error precedence) |
@@ -59,7 +63,7 @@ from per-row data, so their tables are written literally next to the loop.
 | `inheritance_test.cpp` | `cast_to`, `is_assignable_from`, `is_instance`, inherited members |
 | `type_identity_test.cpp` | Type identity and pointer/cv/reference/array decomposition |
 | `enumerator_test.cpp` | `Enumerator`, underlying types, name/value round-trips |
-| `array_test.cpp` | Static arrays and dynamic `Array::new_instance` |
+| `array_test.cpp` | Static arrays, multi-dimensional indexing (`Array::get_length(array, dimension)` and index lists), dynamic `Array::new_instance` including array element types |
 | `registry_test.cpp` | `Class::for_name`, `register_class`, macros, thread safety |
 | `std_library_test.cpp` | Reflecting standard-library types and anonymous unions |
 | `annotation_test.cpp` | C++26 annotations (`[[= expr]]`) on classes, fields, methods |
