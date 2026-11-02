@@ -655,3 +655,53 @@ S8 没有覆盖「这些能力能不能被**物化**进运行期描述表」，P
 
 `Clang`/MSVC 未验证（本库只面向 GCC 16+）。双构建系统（CMake + xmake）均全绿。
 
+## 10. Phase 10：操作语义（2026-11-02 完成）
+
+环境同上（MSYS2 ucrt64 GCC 16.2.0，`-std=c++26 -freflection -fno-rtti -fno-exceptions`）。
+落地内容：`ValueCategory` + `ObjectRef::as_rvalue` / `as_lvalue`、`Method::invoke_rvalue`、
+移动 thunk 与 `Class::assign` / `swap` / `destroy`、`Object::move_from`、`default_argument<T>`
+与 `invoke_with_defaults`、`Field::is_thread_local` / `get_static_address`、转换运算符 /
+可变参数修饰。`ctest` 5/5，309 个用例全绿（新增 41 个）。
+
+### 10.1 动手前补做的探针（`spikes/s10_*.cpp`）
+
+| 文件 | 覆盖 | 结论 |
+|---|---|---|
+| `s10_probe.cpp` | `ObjectRef` 布局、`has_thread_storage_duration`、默认注解读取、`[[no_unique_address]]` | `ObjectRef` 实际 24 字节；`has_thread_storage_duration` 对 `thread_local` 静态成员为 true；`default_argument<T>` 可 `extract`，但 `type_of` 带顶层 const；**没有**检测已声明成员 `[[no_unique_address]]` 的谓词 |
+| `s10_conv.cpp` | 转换运算符的枚举与 `return_type_of` | `is_function` / `is_conversion_function` 为 true、`has_identifier` 为 false（名字是 display 串）；`return_type_of` 可用，`type_of` 抛异常 |
+| `s10_ctad.cpp` | `default_argument{7}` 的 CTAD | 聚合 CTAD 可用（设计文档的写法成立） |
+
+### 10.2 实现偏差（已回写 `api_design.md`）
+
+| 项 | 原设计 | 实际 | 原因 |
+|---|---|---|---|
+| `ObjectRef` 布局 | 16 字节 | **24 字节** | 两个指针 + 3 个 `bool`（const/volatile/rvalue）+ 尾部填充；值类别加进去后仍是 24，测试用 `static_assert` 锁住 |
+| `Function::invoke_rvalue` / `is_rvalue_invokable` | Method / Function 都有 | **只 Method 有** | 自由函数没有接收者，不存在值类别（用户决定） |
+| `Class::is_thread_local` / `get_static_address` | `class Class / Field` | **只有 `Field`** | 类本身没有存储期，只有静态数据成员有 |
+| `Modifier::NO_UNIQUE_ADDRESS` | 信息性置位 | **保留位、永不置位、无查询** | GCC 16.2 的 `<meta>` 没有检测已声明成员的谓词；`data_member_options.no_unique_address` 只用于 `define_aggregate` |
+| 默认实参缺注解 | 「消息里指出第几个形参没有默认值」 | `required_parameter_count` 只按注解计算，缺注解表现为「expected at least N argument(s)」 | 编译器自己的 `= value` 在反射层不可见，无法区分「没写注解」与「编译器没有默认值」 |
+| 转换运算符 thunk | 未提 | 用 `static_cast<T>(receiver)` 而不是成员函数指针 | 转换运算符的 `type_of` 不是函数类型（GCC 抛异常），`extract` 无法构造 MFP |
+
+### 10.3 新 API 的检查顺序
+
+已写进 `api_design.md` §0.1：`invoke` / `invoke_ref` / `invoke_rvalue` 的 ref-qualifier
+拒绝在接收者类型之后、cv 检查之前；`invoke_with_defaults` 是「个数上限 → 最少个数 →
+默认值可读 → invoke 的检查」；`assign` / `swap` / `destroy` / `move_from` 均为
+「空 → 类型 → cv → 能力」。
+
+### 10.4 测试
+
+| 文件 | 用例数 | 覆盖 |
+|---|---|---|
+| `value_category_test.cpp` | 12 | 24 字节静态断言、默认左值 / 标记不改地址、const/volatile 传递、`&` / `&&` / 无限定三条路径、静态方法、右值路径的接收者矩阵 |
+| `move_test.cpp` | 14 | 拷贝/移动赋值选择、错误路径、不可移动类型、`swap`、placement `destroy`、`Object::move_from`（同类型 / move-only / 空源 / 类型不符 / 不可移动） |
+| `default_argument_test.cpp` | 9 | 注解可见性与内层值、`Method` / `Constructor` / `Function` 三处补齐、静态方法、个数错误、不可读注解 |
+| `storage_test.cpp` | 6 | `thread_local` / static / constexpr / 实例字段的存储期与地址、`NO_UNIQUE_ADDRESS` 未置位、转换运算符的识别与调用、可变参数方法 |
+
+双构建系统（CMake + xmake）均全绿；新增测试文件后 CMake 需要重新 configure（`file(GLOB_RECURSE)`）。
+
+组合覆盖按 @.agents/testing.md §3 执行：`Class::assign` 5 × 6、`Class::swap` 5 × 5、
+`invoke_with_defaults` 5 × 6、`ObjectRef` 视图 × 操作 6 × 3、`Method::invoke_rvalue`
+接收者 × 实参 6 × 2（`&&`）/ 6 × 1（`&` 与无 qualifier）、存储期 5 × 2；全部 ≤ 64 格，
+因此用全笛卡尔积而不是 pairwise，每个格子都有断言。
+

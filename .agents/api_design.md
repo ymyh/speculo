@@ -52,6 +52,17 @@ v2 要求：第 1–5 步有意的偏离（例如「先查能力再查类型」�
 | `Class::new_aggregate` / 聚合伪 `Constructor::new_instance` | 能力（非聚合或某槽位不可初始化 → `NotSupported`）→ 实参个数（`InvalidArgument`）→ 逐参左到右（`TypeMismatch`） |
 | `Callable::invoke` / `invoke_ref` | 接收者是否适用（自由函数指针带接收者 → `NotSupported`）→ 实参个数 → 接收者（空 → `NullInstance`；类型 → `TypeMismatch`）→ 逐参左到右 |
 
+**Phase 10 新增/变更的检查顺序**：
+
+| API | 检查顺序 |
+|---|---|
+| `Method::invoke` / `invoke_ref` / `invoke_rvalue` | 实参个数 → 接收者空 → 接收者类型 → ref-qualifier（`invoke` 遇 `&&` / `invoke_rvalue` 遇 `&` → `NotSupported`）→ 非 const 方法遇 const 接收者（`ReadOnly`）→ 非 volatile 方法遇 volatile 接收者（`NotSupported`）→ 逐参左到右。`invoke` 与 `invoke_rvalue` 对 `&&` / `&` 的拒绝发生在接收者类型之后、cv 检查之前。 |
+| `Method::invoke_with_defaults` / `Constructor::invoke_with_defaults` / `Function::invoke_with_defaults` | 实参个数超过形参数（`InvalidArgument`）→ 少于 `get_required_parameter_count()`（`InvalidArgument`）→ 补齐缺失的尾部默认值（注解存在但不可读 → `NotSupported`）→ 转入 `invoke` / `new_instance` 的检查（接收者、cv、逐参）。 |
+| `Class::assign(dst, src)` | dst 空 → src 空（`NullInstance`）→ dst 类型 → src 类型（`TypeMismatch`）→ dst const（`ReadOnly`）→ dst / src volatile（`NotSupported`）→ 按值类别选 move_assign / copy_assign（都没有 → `NotSupported`）。 |
+| `Class::swap(a, b)` | a 空 → b 空（`NullInstance`）→ a 类型 → b 类型（`TypeMismatch`）→ 任一 const（`ReadOnly`）→ 任一 volatile（`NotSupported`）→ `swap` 能力（`NotSupported`）。 |
+| `Class::destroy(obj)` | obj 空（`NullInstance`）→ 类型（`TypeMismatch`）→ volatile（`NotSupported`）→ 可析构（`NotSupported`）。const 对象允许析构。 |
+| `Object::move_from(source)` | source 空（`NullInstance`）→ 目标非空且类型不同（`TypeMismatch`）→ 可移动构造（`NotSupported`）。 |
+
 
 ## 1. 模板信息
 
@@ -448,7 +459,6 @@ struct default_argument   // 与形参同型，仅作注解载体
 // 声明侧：注解给反射看，`= 0` 给编译器看，两处都要写
 void f(int a, [[= speculo::default_argument{0}]] int b = 0);
 ```
-
 ```cpp
 class Method / Constructor / Function {
 public:
@@ -463,6 +473,22 @@ public:
 
 规则：只补**尾部**形参；补进来的实参按 v1 的精确类型规则匹配；注解值不可读
 （类型含指针/引用）→ `NotSupported`（与注解可读性判定一致）。
+
+> **Phase 10 实现说明（GCC 16.2）**
+> - `get_parameter_default(i)` 返回的是**包装类型** `default_argument<T>` 的句柄；用
+>   `annotation.get<default_argument<T>>()` 取内层的 `T`。注解不可读时仍然返回 `Some`，
+>   但 `is_readable() == false`。
+> - `get_required_parameter_count()` **只按注解**计算（尾部带 `default_argument<T>` 的形参算可选）。
+>   编译器自己的 `= value` 在反射层不可见，所以「编译器有默认值但没写注解」会被当成必填，
+>   错误是「expected at least N argument(s)」而不是逐个指出缺注解的形参。
+> - `get_parameter_default(index)` 的 `index` 越界是前置条件违反（`panic`），与
+>   `get_parameter_annotations(index)` 一致。
+> - `Constructor` 上同样提供 `invoke_with_defaults`（返回 `Outcome<Object>`，内部走
+>   `new_instance`），`Function` 无 self 参数。
+> - 补齐默认值通过 `ObjectRef` 视图指向注解的静态值完成，不复制、不分配；默认值是 const 视图，
+>   因此只可绑定到按值参数或 `const T&` / `const T&&`，不能绑定 `T&`。
+> - `[[= speculo::default_argument{0}]]` 的聚合 CTAD 在 GCC 16.2 可用（`spikes/s10_ctad.cpp`）；
+>   也可以显式写 `default_argument<int>{0}`。
 
 ## 8. 值类别与移动语义
 
@@ -485,7 +511,9 @@ public:
 };
 ```
 
-值类别塞进 `ObjectRef` 已有的 flags 位（不改变 16 字节布局）。
+值类别塞进 `ObjectRef` 已有的 flags 位。**实测当前 `ObjectRef` 是 24 字节**（两个指针 +
+3 个 `bool`，尾部填充），不是早期文档写的 16 字节；加值类别不改变 24 字节布局，测试用
+`static_assert(sizeof(ObjectRef) == 24)` 锁住。
 
 > **spike S8.7 结论（GCC 16.2 实测）**：`is_lvalue_reference_qualified` /
 > `is_rvalue_reference_qualified` 两个谓词都存在且互斥；`type_of(成员函数)` 保留
@@ -495,17 +523,17 @@ public:
 > `invoke_rvalue` 不需要任何编译器降级，按 §8.2 实现即可。
 
 ```cpp
-class Method / Function {
+class Method {
 public:
-    Outcome<Object> invoke_rvalue(ObjectRef self, Args args = {}) const;  // 接收者按右值
+    Outcome<Object> invoke_rvalue(ObjectRef self, Args args = {});  // 接收者按右值
     bool is_rvalue_invokable() const;   // `&&` 限定方法仅此路径可用
 };
 
 class Class {
 public:
-    Status assign(ObjectRef dst, ObjectRef src) const;  // 拷贝/移动赋值；不可赋值 → NotSupported
-    Status swap(ObjectRef a, ObjectRef b) const;        // 需可移动赋值
-    Status destroy(ObjectRef obj) const;                // 原地析构，不释放存储
+    Status assign(ObjectRef dst, ObjectRef src);  // 拷贝/移动赋值；不可赋值 → NotSupported
+    Status swap(ObjectRef a, ObjectRef b);        // 需可移动构造 + 可移动赋值
+    Status destroy(ObjectRef obj);                // 原地析构，不释放存储
 };
 
 class Object {
@@ -516,18 +544,28 @@ public:
 
 规则：
 
-- `Method::invoke` / `Function::invoke` 的语义**不变**（接收者按左值、`T&&` 形参仍按右值转发），
-  v2 只是把「右值」变成可显式表达的视图，不破坏已有调用。
-- `invoke_ref` 的返回视图类型不变；右值接收者的成员引用仍然是左值，按语言规则。
-- 移动 thunk 随描述表生成（`MoveCtorFn` / `MoveAssignFn`）；不可移动 → 函数指针为
-  `nullptr`，即能力缺失标志（与 v1 的 `clone` 一致）。
+- `Method::invoke` 的语义**不变**（接收者按左值、`T&&` 形参仍按右值转发），
+  `&&` 限定的方法只在 `invoke_rvalue` 下可用，`&` 限定的方法在 `invoke_rvalue` 下是
+  `NotSupported`。`invoke_rvalue` 不要求接收者视图先 `as_rvalue()`；它显式选择右值路径。
+  `as_rvalue()` 供按值类别分派的 API（目前是 `Class::assign`）使用。
+- **`Function` 不提供 `invoke_rvalue` / `is_rvalue_invokable`**：自由函数没有接收者，
+  不存在值类别。`phases.md` 原清单里的这一项按实现删去。
+- `Method::invoke_ref` 仍只走左值路径；返回引用的 `&&` 方法可通过 `invoke_rvalue` 装箱
+  （非引用结果），需要引用视图时仍应把方法设计为左值路径。返回 `T&` / `const T&` 的视图是
+  左值，返回 `T&&` 的视图是右值；`Class::cast_to` 保留输入视图的值类别。
+- 移动 thunk 随描述表生成（`MoveCtorFn` / `MoveAssignFn` / `SwapFn`）；不可移动 →
+  函数指针为 `nullptr`，即能力缺失标志（与 v1 的 `clone` 一致）。
+- `Class::assign` 在 `src.value_category() == Rvalue` 且 `move_assign` 非空时移动赋值，
+  否则回退拷贝赋值；两者都缺 → `NotSupported`。
 - `Class::destroy(obj)` 只析构、不释放：用于 placement 场景；与 `Constructor::destroy_at`
-  的区别是作用于任意 `ObjectRef`，不需要知道构造签名。
+  的区别是作用于任意 `ObjectRef`，不需要知道构造签名。const 对象允许析构，volatile 拒绝。
+- `Object::move_from` 是 `destroy + move_ctor` 的组合：`other` 保持有效（moved-from），
+  与 `operator=(Object&&)` 的所有权转移不同。
 
 ## 9. 存储期与剩余修饰
 
 ```cpp
-class Class / Field {
+class Field {
 public:
     bool is_thread_local() const;                    // static thread_local 数据成员
     Option<const void*> get_static_address() const;  // 静态数据成员的地址（不含可写权限）
@@ -535,9 +573,12 @@ public:
 
 // 新增修饰位（v1 位值不变，仅在空位追加）
 Modifier::THREAD_LOCAL        // 1u << 22
-Modifier::NO_UNIQUE_ADDRESS   // 1u << 23，[[no_unique_address]]，信息性（偏移已如实给出）
+Modifier::NO_UNIQUE_ADDRESS   // 1u << 23，保留、永不置位（GCC 16.2 无法检测）
 Modifier::CONVERSION          // 1u << 24，转换运算符
-Modifier::VARIADIC            // 1u << 25，C 可变参数（Method 侧补齐）
+Modifier::VARIADIC            // 1u << 25，C 可变参数（Method / Function 侧）
+
+// 查询：Modifier::is_thread_local() / is_conversion() / is_variadic()
+// （NO_UNIQUE_ADDRESS 不提供查询；to_string() 只输出实际置位的三个新词）
 
 class Method {
 public:
@@ -547,8 +588,20 @@ public:
 };
 ```
 
+> **Phase 10 实现说明（GCC 16.2）**
+> - **`Class` 上没有 `is_thread_local` / `get_static_address`**：类本身没有存储期，只有静态
+>   数据成员有。原设计中的 `class Class / Field` 按实现收窄到 `Field`。
+> - `NO_UNIQUE_ADDRESS` 只保留位值，**永不置位**，也不提供 `is_no_unique_address()`：
+>   `<meta>` 只有 `data_member_options.no_unique_address`（`define_aggregate` 用），
+>   没有检测已声明成员的谓词。与 `INLINE` / `CONSTEXPR` / `CONSTEVAL` 的既有处理一致。
+> - `Method::get_conversion_type()` 用 `return_type_of` 取目标类型；转换运算符的
+>   `type_of` 不是函数类型（GCC 抛异常），所以它的 thunk 用 `static_cast<T>(receiver)`
+>   生成，而不是成员函数指针。
+> - `Modifier::VARIADIC` 同时用于 `Method` 与 `Function`；`Function::is_variadic()` 已存在。
+
 `get_static_address()` 返回 `const void*`（与 v1「不提供可写裸地址」的取舍一致）；
-需要写就继续用 `Field::set`。
+需要写就继续用 `Field::set`。非静态成员与位域返回 `None`；`thread_local` 成员返回**当前线程**
+副本的地址。`is_thread_local()` 对非静态成员恒为 false。
 
 > **spike S8.8 结论（GCC 16.2 实测）**：没有 `is_thread_local` 这个名字，对应谓词是
 > **`has_thread_storage_duration`**，对 `thread_local` 命名空间变量与 `thread_local`

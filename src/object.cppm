@@ -58,6 +58,34 @@ template<typename T>
 [[nodiscard]] auto class_of() -> const Class&;
 
 /**
+ * @brief Value category of an ObjectRef view (api_design §8.2)
+ *
+ * An ObjectRef always refers to an existing object; the category only says
+ * whether reflective operations may treat it as an lvalue or an rvalue. It is
+ * a view-level flag, never a property of the object itself.
+ */
+enum class ValueCategory
+{
+    Lvalue,
+    Rvalue,
+};
+
+/**
+ * @brief Annotation carrying one parameter's default value (api_design §7)
+ *
+ * P2996 exposes parameter types but not default arguments, so the value has to
+ * be written twice: once where the compiler needs it (`= 0`) and once for the
+ * reflection layer (`[[= speculo::default_argument{0}]]`). Method /
+ * Constructor / Function::get_parameter_default and invoke_with_defaults() read
+ * the annotation.
+ */
+template<typename T>
+struct default_argument
+{
+    T value;
+};
+
+/**
  * @brief Non-owning, type-erased reference to an existing object or subobject
  * @note Lifetime is the caller's responsibility (span-like semantics).
  */
@@ -89,6 +117,24 @@ public:
     /// non-volatile calls would access it as a non-volatile object, so they are
     /// refused; `as<volatile T>()` gives the volatile access explicitly.
     [[nodiscard]] auto is_volatile() const noexcept -> bool { return m_is_volatile; }
+
+    /// The view's value category (Lvalue by default; see as_rvalue()).
+    [[nodiscard]] auto value_category() const noexcept -> ValueCategory
+    {
+        return m_is_rvalue ? ValueCategory::Rvalue : ValueCategory::Lvalue;
+    }
+
+    /// The same view, marked as an rvalue. No data is moved.
+    [[nodiscard]] auto as_rvalue() const noexcept -> ObjectRef
+    {
+        return ObjectRef(m_data, m_desc, m_is_const, m_is_volatile, ValueCategory::Rvalue);
+    }
+
+    /// The same view, marked as an lvalue (the default).
+    [[nodiscard]] auto as_lvalue() const noexcept -> ObjectRef
+    {
+        return ObjectRef(m_data, m_desc, m_is_const, m_is_volatile, ValueCategory::Lvalue);
+    }
 
     /// The referenced type; panics if the reference is null.
     [[nodiscard]] auto type() const -> const Class&;
@@ -125,11 +171,12 @@ private:
 
     /// Internal descriptor-based constructor.
     ObjectRef(const void* data, const detail::TypeDescriptor* desc, bool is_const = false,
-              bool is_volatile = false) noexcept
+              bool is_volatile = false, ValueCategory category = ValueCategory::Lvalue) noexcept
         : m_data(data)
         , m_desc(desc)
         , m_is_const(is_const)
         , m_is_volatile(is_volatile)
+        , m_is_rvalue(category == ValueCategory::Rvalue)
     {
     }
 
@@ -139,6 +186,7 @@ private:
     const detail::TypeDescriptor* m_desc = nullptr;
     bool                          m_is_const = false;
     bool                          m_is_volatile = false;
+    bool                          m_is_rvalue = false;
 };
 
 /**
@@ -214,6 +262,50 @@ public:
         }
 
         return from_raw(m_desc->clone(m_data), m_desc);
+    }
+
+    /**
+     * @brief Move-constructs `other`'s value into this box (api_design §8.2)
+     *
+     * The current value (if any) is destroyed first, then a new object is
+     * move-constructed next to it. `other` stays a valid (moved-from) object;
+     * this is not ownership transfer -- use `operator=(Object&&)` for that.
+     * The two boxes must hold the same type when this one is non-empty.
+     *
+     * @return NullInstance when other is empty; TypeMismatch when the types
+     *         differ; NotSupported when the type is not move-constructible.
+     */
+    [[nodiscard]] auto move_from(Object&& other) -> Status
+    {
+        if (other.m_data == nullptr || other.m_desc == nullptr)
+        {
+            return Error{ErrorKind::NullInstance, "Object::move_from(): the source object is empty"};
+        }
+
+        if (this == std::addressof(other))
+        {
+            return None{};
+        }
+
+        if (m_data != nullptr && m_desc != other.m_desc)
+        {
+            return Error{ErrorKind::TypeMismatch,
+                         std::format("Object::move_from(): this box holds '{}', the source holds '{}'",
+                                     m_desc->qualified_name, other.m_desc->qualified_name)};
+        }
+
+        if (other.m_desc->move_ctor == nullptr)
+        {
+            return Error{ErrorKind::NotSupported,
+                         std::format("Object::move_from(): '{}' is not move-constructible",
+                                     other.m_desc->qualified_name)};
+        }
+
+        reset();
+        m_data = other.m_desc->move_ctor(other.m_data);
+        m_desc = other.m_desc;
+
+        return None{};
     }
 
     [[nodiscard]] auto is_null() const noexcept -> bool { return m_data == nullptr; }
@@ -466,6 +558,26 @@ public:
 private:
     static constexpr std::size_t kInlineCapacity = 8;
 
+    /// Internal: views an already-built sequence (used to append default arguments).
+    explicit Args(std::span<const ObjectRef> refs)
+    {
+        if (refs.size() <= kInlineCapacity)
+        {
+            m_size = refs.size();
+            for (std::size_t i = 0; i < refs.size(); ++i)
+            {
+                m_inline[i] = refs[i];
+            }
+        }
+        else
+        {
+            m_heap = new std::vector<ObjectRef>(refs.begin(), refs.end());
+            m_size = refs.size();
+        }
+    }
+
+    friend struct detail::Access;
+
     auto release() noexcept -> void
     {
         delete m_heap;
@@ -493,6 +605,30 @@ class ArgumentPointers
 {
 public:
     explicit ArgumentPointers(const Args& args)
+    {
+        const std::size_t count = args.size();
+        if (count <= kInlineCapacity)
+        {
+            for (std::size_t i = 0; i < count; ++i)
+            {
+                m_inline[i] = args[i].raw_data();
+            }
+
+            m_data = m_inline.data();
+        }
+        else
+        {
+            m_heap.resize(count);
+            for (std::size_t i = 0; i < count; ++i)
+            {
+                m_heap[i] = args[i].raw_data();
+            }
+
+            m_data = m_heap.data();
+        }
+    }
+
+    explicit ArgumentPointers(std::span<const ObjectRef> args)
     {
         const std::size_t count = args.size();
         if (count <= kInlineCapacity)
@@ -667,6 +803,19 @@ template<typename T>
     return None{};
 }
 
+/// The first `default_argument<T>` annotation in a parameter's annotation list.
+[[nodiscard]] auto parameter_default(std::span<const Annotation> annotations) -> Option<Annotation>;
+
+/// Builds an Args view over a resolved sequence (used to append defaults).
+[[nodiscard]] auto make_args(std::span<const ObjectRef> refs) -> Args;
+
+/// See the definition for the contract (api_design §7).
+template<typename GetAnnotations>
+[[nodiscard]] auto append_default_arguments(std::string_view callee, std::vector<ObjectRef>& out,
+                                            const Args& provided, std::size_t parameter_count,
+                                            std::size_t required_count,
+                                            GetAnnotations get_annotations) -> Status;
+
 } // namespace speculo::detail
 
 export namespace speculo
@@ -685,6 +834,28 @@ public:
     [[nodiscard]] auto get_type() const -> const Class& { return *m_desc->type->self; }
     [[nodiscard]] auto modifiers() const -> Modifier { return Modifier(m_desc->modifiers); }
     [[nodiscard]] auto is_static() const -> bool { return m_desc->is_static; }
+
+    /// Whether this is a `static thread_local` data member (api_design §9).
+    /// Always false for non-static members.
+    [[nodiscard]] auto is_thread_local() const -> bool { return m_desc->is_thread_local; }
+
+    /**
+     * @brief Address of a static data member (read-only)
+     * @return Some(address) for a static member with an address; None for a
+     *         non-static member or a bitfield
+     * @note Returns `const void*`: the library never hands out a writable raw
+     *       address (use set() to write). For a `thread_local` member the address
+     *       is the current thread's copy.
+     */
+    [[nodiscard]] auto get_static_address() const -> Option<const void*>
+    {
+        if (!is_static() || m_desc->get_ref == nullptr)
+        {
+            return None{};
+        }
+
+        return static_cast<const void*>(m_desc->get_ref(nullptr));
+    }
 
     /// Reads the field value (a boxed copy); obj is ignored for static fields.
     [[nodiscard]] auto get(ObjectRef obj) const -> Outcome<Object>
@@ -933,12 +1104,35 @@ public:
     /// thunk cannot express).
     [[nodiscard]] auto is_invokable() const -> bool { return m_desc->invoke != nullptr; }
 
+    /// Whether invoke_rvalue() can run this method: unqualified methods and
+    /// `&&`-qualified ones (api_design §8.2).
+    [[nodiscard]] auto is_rvalue_invokable() const -> bool { return m_desc->invoke_rvalue != nullptr; }
+
     /// `= delete`d (listed so overloads are complete; never invokable).
     [[nodiscard]] auto is_deleted() const -> bool { return modifiers().is_deleted(); }
     [[nodiscard]] auto is_defaulted() const -> bool { return modifiers().is_defaulted(); }
     [[nodiscard]] auto is_override() const -> bool { return modifiers().is_override(); }
     [[nodiscard]] auto is_operator() const -> bool { return m_desc->is_operator; }
     [[nodiscard]] auto is_destructor() const -> bool { return m_desc->is_destructor; }
+
+    /// Whether this is a conversion operator (`operator T`).
+    [[nodiscard]] auto is_conversion_operator() const -> bool { return m_desc->is_conversion; }
+
+    /// The target type of a conversion operator; None for every other method.
+    [[nodiscard]] auto get_conversion_type() const -> Option<const Class&>
+    {
+        if (!m_desc->is_conversion || m_desc->return_type == nullptr)
+        {
+            return None{};
+        }
+
+        return *m_desc->return_type->self;
+    }
+
+    /// Whether this is a C-style variadic member function (`...`). Only the fixed
+    /// parameters are listed; invoke() / invoke_rvalue() are NotSupported.
+    [[nodiscard]] auto is_variadic() const -> bool { return modifiers().is_variadic(); }
+
     [[nodiscard]] auto get_ref_qualifier() const -> RefQualifier { return m_desc->ref_qualifier; }
     [[nodiscard]] auto get_signature() const -> std::string_view { return m_desc->signature; }
 
@@ -970,6 +1164,20 @@ public:
     [[nodiscard]] auto get_parameter_annotation(std::size_t index) const -> Option<const T&>
     {
         return detail::first_annotation<T>(get_parameter_annotations(index));
+    }
+
+    /// The `default_argument<T>` annotation of parameter `index`, if any
+    /// (api_design §7). None when the parameter has no default annotation.
+    [[nodiscard]] auto get_parameter_default(std::size_t index) const -> Option<Annotation>
+    {
+        return detail::parameter_default(get_parameter_annotations(index));
+    }
+
+    /// Number of leading parameters that must be supplied; trailing ones with a
+    /// `default_argument<T>` annotation are optional.
+    [[nodiscard]] auto get_required_parameter_count() const -> std::size_t
+    {
+        return m_desc->required_parameter_count;
     }
 
     /// Whether the method returns an lvalue or rvalue reference. get_return_type()
@@ -1023,6 +1231,46 @@ public:
     }
 
     /**
+     * @brief Invokes the method with an rvalue receiver (api_design §8.2)
+     *
+     * This is the only path that can call an `&&`-qualified member function; an
+     * `&`-qualified method is NotSupported here. Unqualified methods are callable
+     * through both invoke() and invoke_rvalue(). The receiver's own
+     * value_category() does not have to be Rvalue: this call explicitly chooses
+     * the rvalue path (as_rvalue() is for APIs that dispatch on the category,
+     * such as Class::assign()).
+     */
+    [[nodiscard]] auto invoke_rvalue(ObjectRef obj, Args args = {}) const -> Outcome<Object>
+    {
+        const Status checked = check_call("Method::invoke_rvalue", obj, args, ValueCategory::Rvalue);
+        if (checked.is_err())
+        {
+            return checked.unwrap_err();
+        }
+
+        if (m_desc->invoke_rvalue == nullptr)
+        {
+            const char* reason = is_deleted() ? "the function is deleted"
+                                 : get_ref_qualifier() == RefQualifier::Lvalue
+                                     ? "the method is lvalue-qualified (&) and cannot be called on an rvalue"
+                                 : is_variadic() ? "a C variadic function cannot be called through this handle"
+                                                 : "the method is not available";
+            return Error{ErrorKind::NotSupported,
+                         std::format("{}: {}", context("Method::invoke_rvalue"), reason)};
+        }
+
+        const detail::ArgumentPointers pointers = argument_pointers(args);
+        void* receiver = is_static_member() ? nullptr : const_cast<void*>(obj.raw_data());
+        void* result = m_desc->invoke_rvalue(receiver, pointers.data());
+        if (result == nullptr)
+        {
+            return Object{};
+        }
+
+        return Object::from_raw(result, m_desc->return_type->decayed);
+    }
+
+    /**
      * @brief Invokes a reference-returning method and views the referent (no copy)
      *
      * The returned view's type() is the referent's object type `T` (handles do not
@@ -1063,15 +1311,61 @@ public:
         const detail::TypeDescriptor* referent = m_desc->return_type->referenced;
 
         return ObjectRef(address, m_desc->return_type->decayed, referent->is_const_qualified,
-                         referent->is_volatile_qualified);
+                         referent->is_volatile_qualified,
+                         m_desc->return_type->reference_kind == RefQualifier::Rvalue ? ValueCategory::Rvalue
+                                                                                   : ValueCategory::Lvalue);
+    }
+
+    /**
+     * @brief Invokes the method, filling trailing arguments from `default_argument` annotations
+     *
+     * Check order (api_design §7): too many arguments -> fewer than
+     * get_required_parameter_count() -> unreadable default -> invoke()'s own
+     * count / receiver / argument checks. A missing annotation for a parameter
+     * that is still required is InvalidArgument.
+     */
+    [[nodiscard]] auto invoke_with_defaults(ObjectRef obj, Args args = {}) const -> Outcome<Object>
+    {
+        const std::size_t count = m_desc->parameter_count;
+        if (args.size() > count)
+        {
+            return Error{ErrorKind::InvalidArgument,
+                         std::format("{}: expected at most {} argument(s), got {}",
+                                     context("Method::invoke_with_defaults"), count, args.size())};
+        }
+
+        if (args.size() < m_desc->required_parameter_count)
+        {
+            return Error{ErrorKind::InvalidArgument,
+                         std::format("{}: expected at least {} argument(s), got {}",
+                                     context("Method::invoke_with_defaults"), m_desc->required_parameter_count,
+                                     args.size())};
+        }
+
+        if (args.size() == count)
+        {
+            return invoke(obj, std::move(args));
+        }
+
+        std::vector<ObjectRef> all;
+        const Status appended = detail::append_default_arguments(
+            context("Method::invoke_with_defaults"), all, args, count, m_desc->required_parameter_count,
+            [this](std::size_t index) { return get_parameter_annotations(index); });
+        if (appended.is_err())
+        {
+            return appended.unwrap_err();
+        }
+
+        return invoke(obj, detail::make_args(std::span<const ObjectRef>(all)));
     }
 
     [[nodiscard]] auto operator==(const Method& other) const noexcept -> bool { return m_desc == other.m_desc; }
     [[nodiscard]] auto operator!=(const Method& other) const noexcept -> bool { return m_desc != other.m_desc; }
 
 private:
-    /// Validates the receiver and the arguments, shared by invoke() / invoke_ref().
-    [[nodiscard]] auto check_call(std::string_view operation, const ObjectRef& obj, const Args& args) const -> Status
+    /// Validates the receiver and the arguments, shared by invoke() / invoke_rvalue() / invoke_ref().
+    [[nodiscard]] auto check_call(std::string_view operation, const ObjectRef& obj, const Args& args,
+                                  ValueCategory category = ValueCategory::Lvalue) const -> Status
     {
         const std::size_t count = m_desc->parameter_count;
         if (args.size() != count)
@@ -1088,6 +1382,22 @@ private:
         if (!is_static_member() && obj.descriptor() != m_desc->declaring_class->decayed)
         {
             return detail::receiver_mismatch(context(operation), m_desc->declaring_class, obj);
+        }
+
+        if (!is_static_member() && category == ValueCategory::Rvalue
+            && get_ref_qualifier() == RefQualifier::Lvalue)
+        {
+            return Error{ErrorKind::NotSupported,
+                         std::format("{}: the method is lvalue-qualified (&) and cannot be called on an rvalue",
+                                     context(operation))};
+        }
+
+        if (!is_static_member() && category == ValueCategory::Lvalue
+            && get_ref_qualifier() == RefQualifier::Rvalue)
+        {
+            return Error{ErrorKind::NotSupported,
+                         std::format("{}: the method is rvalue-qualified (&&); use invoke_rvalue()",
+                                     context(operation))};
         }
 
         if (!is_static_member() && !is_const() && obj.is_const())
@@ -1265,6 +1575,18 @@ public:
         return detail::first_annotation<T>(get_parameter_annotations(index));
     }
 
+    /// The `default_argument<T>` annotation of parameter `index`, if any (api_design §7).
+    [[nodiscard]] auto get_parameter_default(std::size_t index) const -> Option<Annotation>
+    {
+        return detail::parameter_default(get_parameter_annotations(index));
+    }
+
+    /// Number of leading parameters that must be supplied (trailing defaults excluded).
+    [[nodiscard]] auto get_required_parameter_count() const -> std::size_t
+    {
+        return m_desc->required_parameter_count;
+    }
+
     /// Heap-constructs an owning Object by invoking this constructor.
     [[nodiscard]] auto new_instance(Args args = {}) const -> Outcome<Object>
     {
@@ -1287,6 +1609,45 @@ public:
 
         const detail::ArgumentPointers pointers = argument_pointers(args);
         return Object::from_raw(m_desc->new_instance(pointers.data()), m_desc->declaring_class);
+    }
+
+    /**
+     * @brief Constructs an instance, filling trailing arguments from annotations
+     * @note Same check order as Method::invoke_with_defaults() (api_design §7).
+     */
+    [[nodiscard]] auto invoke_with_defaults(Args args = {}) const -> Outcome<Object>
+    {
+        const std::size_t count = m_desc->parameter_count;
+        if (args.size() > count)
+        {
+            return Error{ErrorKind::InvalidArgument,
+                         std::format("{}: expected at most {} argument(s), got {}",
+                                     context("Constructor::invoke_with_defaults"), count, args.size())};
+        }
+
+        if (args.size() < m_desc->required_parameter_count)
+        {
+            return Error{ErrorKind::InvalidArgument,
+                         std::format("{}: expected at least {} argument(s), got {}",
+                                     context("Constructor::invoke_with_defaults"), m_desc->required_parameter_count,
+                                     args.size())};
+        }
+
+        if (args.size() == count)
+        {
+            return new_instance(std::move(args));
+        }
+
+        std::vector<ObjectRef> all;
+        const Status appended = detail::append_default_arguments(
+            context("Constructor::invoke_with_defaults"), all, args, count, m_desc->required_parameter_count,
+            [this](std::size_t index) { return get_parameter_annotations(index); });
+        if (appended.is_err())
+        {
+            return appended.unwrap_err();
+        }
+
+        return new_instance(detail::make_args(std::span<const ObjectRef>(all)));
     }
 
     /// Placement-constructs into caller-provided storage.
@@ -2236,6 +2597,166 @@ public:
                                  get_qualified_name(), detail::describe_arguments(args))};
     }
 
+    /**
+     * @brief Assigns one object of this class into another (api_design §8.2)
+     *
+     * When `src` is an rvalue view (`as_rvalue()`) and the type is move-assignable,
+     * move assignment is used; otherwise copy assignment. Neither available ->
+     * NotSupported. Check order: dst null -> src null -> dst type -> src type ->
+     * const dst -> volatile dst/src -> available thunk.
+     */
+    [[nodiscard]] auto assign(ObjectRef dst, ObjectRef src) const -> Status
+    {
+        if (dst.is_null())
+        {
+            return Error{ErrorKind::NullInstance, std::format("Class::assign({}): the destination is null",
+                                                              get_qualified_name())};
+        }
+
+        if (src.is_null())
+        {
+            return Error{ErrorKind::NullInstance,
+                         std::format("Class::assign({}): the source is null", get_qualified_name())};
+        }
+
+        if (dst.descriptor() != m_desc.get())
+        {
+            return detail::receiver_mismatch("Class::assign", m_desc.get(), dst);
+        }
+
+        if (src.descriptor() != m_desc.get())
+        {
+            return Error{ErrorKind::TypeMismatch,
+                         std::format("Class::assign({}): the source has type '{}', not '{}'", get_qualified_name(),
+                                     src.descriptor()->qualified_name, get_qualified_name())};
+        }
+
+        if (dst.is_const())
+        {
+            return Error{ErrorKind::ReadOnly,
+                         std::format("Class::assign({}): the destination is a const object", get_qualified_name())};
+        }
+
+        if (dst.is_volatile() || src.is_volatile())
+        {
+            return Error{ErrorKind::NotSupported,
+                         std::format("Class::assign({}): a volatile object cannot be assigned", get_qualified_name())};
+        }
+
+        void* target = const_cast<void*>(dst.raw_data());
+        if (src.value_category() == ValueCategory::Rvalue && !src.is_const() && m_desc->move_assign != nullptr)
+        {
+            if (!m_desc->move_assign(target, const_cast<void*>(src.raw_data())))
+            {
+                return Error{ErrorKind::NotSupported,
+                             std::format("Class::assign({}): move assignment failed", get_qualified_name())};
+            }
+
+            return None{};
+        }
+
+        if (m_desc->copy_assign == nullptr)
+        {
+            return Error{ErrorKind::NotSupported,
+                         std::format("Class::assign({}): '{}' is not copy-assignable", get_qualified_name(),
+                                     get_qualified_name())};
+        }
+
+        if (!m_desc->copy_assign(target, src.raw_data()))
+        {
+            return Error{ErrorKind::NotSupported,
+                         std::format("Class::assign({}): copy assignment failed", get_qualified_name())};
+        }
+
+        return None{};
+    }
+
+    /// Exchanges two objects of this class in place. Both must be mutable lvalues;
+    /// requires move construction and move assignment.
+    [[nodiscard]] auto swap(ObjectRef a, ObjectRef b) const -> Status
+    {
+        if (a.is_null())
+        {
+            return Error{ErrorKind::NullInstance, std::format("Class::swap({}): the first object is null",
+                                                              get_qualified_name())};
+        }
+
+        if (b.is_null())
+        {
+            return Error{ErrorKind::NullInstance,
+                         std::format("Class::swap({}): the second object is null", get_qualified_name())};
+        }
+
+        if (a.descriptor() != m_desc.get())
+        {
+            return detail::receiver_mismatch("Class::swap", m_desc.get(), a);
+        }
+
+        if (b.descriptor() != m_desc.get())
+        {
+            return Error{ErrorKind::TypeMismatch,
+                         std::format("Class::swap({}): the second object has type '{}', not '{}'", get_qualified_name(),
+                                     b.descriptor()->qualified_name, get_qualified_name())};
+        }
+
+        if (a.is_const() || b.is_const())
+        {
+            return Error{ErrorKind::ReadOnly,
+                         std::format("Class::swap({}): a const object cannot be swapped", get_qualified_name())};
+        }
+
+        if (a.is_volatile() || b.is_volatile())
+        {
+            return Error{ErrorKind::NotSupported,
+                         std::format("Class::swap({}): a volatile object cannot be swapped", get_qualified_name())};
+        }
+
+        if (m_desc->swap == nullptr)
+        {
+            return Error{ErrorKind::NotSupported,
+                         std::format("Class::swap({}): '{}' is not move-constructible and move-assignable",
+                                     get_qualified_name(), get_qualified_name())};
+        }
+
+        m_desc->swap(const_cast<void*>(a.raw_data()), const_cast<void*>(b.raw_data()));
+        return None{};
+    }
+
+    /**
+     * @brief Destroys an object in place without releasing its storage
+     * @note For placement-constructed storage; for an owning Object use its
+     *       destructor (or Object::move_from to replace the value).
+     */
+    [[nodiscard]] auto destroy(ObjectRef obj) const -> Status
+    {
+        if (obj.is_null())
+        {
+            return Error{ErrorKind::NullInstance,
+                         std::format("Class::destroy({}): the object is null", get_qualified_name())};
+        }
+
+        if (obj.descriptor() != m_desc.get())
+        {
+            return detail::receiver_mismatch("Class::destroy", m_desc.get(), obj);
+        }
+
+        if (obj.is_volatile())
+        {
+            return Error{ErrorKind::NotSupported,
+                         std::format("Class::destroy({}): a volatile object cannot be destroyed", get_qualified_name())};
+        }
+
+        if (m_desc->destroy == nullptr)
+        {
+            return Error{ErrorKind::NotSupported,
+                         std::format("Class::destroy({}): '{}' is not destructible", get_qualified_name(),
+                                     get_qualified_name())};
+        }
+
+        m_desc->destroy(const_cast<void*>(obj.raw_data()));
+        return None{};
+    }
+
     /// Direct base classes, in declaration order (C++-specific; supports multiple inheritance).
     [[nodiscard]] auto get_bases() const -> std::span<const BaseClass>
     {
@@ -2392,7 +2913,7 @@ public:
                                      get_qualified_name(), base.get_qualified_name())};
         }
 
-        return ObjectRef(found, base.descriptor(), obj.is_const(), obj.is_volatile());
+        return ObjectRef(found, base.descriptor(), obj.is_const(), obj.is_volatile(), obj.value_category());
     }
 
     // ── Type-system structure: templates, function types, aggregates, nesting ──
@@ -3543,11 +4064,115 @@ struct Access
     }
 
     [[nodiscard]] static auto view_object(const void* data, const TypeDescriptor* desc, bool is_const,
-                                          bool is_volatile) noexcept -> ObjectRef
+                                          bool is_volatile,
+                                          ValueCategory category = ValueCategory::Lvalue) noexcept -> ObjectRef
     {
-        return ObjectRef(data, desc, is_const, is_volatile);
+        return ObjectRef(data, desc, is_const, is_volatile, category);
+    }
+
+    /// Builds an Args view over an already-resolved sequence (default arguments).
+    [[nodiscard]] static auto make_args(std::span<const ObjectRef> refs) -> Args { return Args(refs); }
+
+    /// Whether this annotation is a `default_argument<T>` (api_design §7).
+    [[nodiscard]] static auto is_default_argument(const Annotation& annotation) noexcept -> bool
+    {
+        return annotation.m_desc.get() != nullptr && annotation.m_desc->is_default_argument;
+    }
+
+    /// The const view of a readable default_argument<T>'s inner value.
+    [[nodiscard]] static auto default_argument_ref(const Annotation& annotation) -> Option<ObjectRef>
+    {
+        const AnnotationDesc* desc = annotation.m_desc.get();
+        if (desc == nullptr || desc->default_value == nullptr || desc->default_type == nullptr)
+        {
+            return None{};
+        }
+
+        return view_object(desc->default_value, desc->default_type, true, false);
     }
 };
+
+inline auto parameter_default(std::span<const Annotation> annotations) -> Option<Annotation>
+{
+    for (const Annotation& annotation : annotations)
+    {
+        if (Access::is_default_argument(annotation))
+        {
+            return annotation;
+        }
+    }
+
+    return None{};
+}
+
+inline auto make_args(std::span<const ObjectRef> refs) -> Args
+{
+    return Access::make_args(refs);
+}
+
+/**
+ * @brief Appends trailing default arguments to a call (api_design §7)
+ * @param out Receives the provided views plus one const view per missing parameter
+ * @param provided Arguments the caller wrote
+ * @param parameter_count Total parameters of the callee
+ * @param required_count Parameters without a default (get_required_parameter_count)
+ * @param get_annotations Returns parameter `i`'s annotations
+ * @return InvalidArgument when a missing parameter has no default_argument annotation;
+ *         NotSupported when the annotation exists but its value is not readable
+ *
+ * The caller must have checked args.size() <= parameter_count and
+ * args.size() >= required_count beforehand.
+ */
+template<typename GetAnnotations>
+[[nodiscard]] auto append_default_arguments(std::string_view callee, std::vector<ObjectRef>& out,
+                                            const Args& provided, std::size_t parameter_count,
+                                            std::size_t required_count,
+                                            GetAnnotations get_annotations) -> Status
+{
+    out.reserve(parameter_count);
+    for (std::size_t i = 0; i < provided.size(); ++i)
+    {
+        out.push_back(provided[i]);
+    }
+
+    for (std::size_t i = provided.size(); i < parameter_count; ++i)
+    {
+        const std::span<const Annotation> annotations = get_annotations(i);
+        Option<ObjectRef> value = None{};
+        bool has_annotation = false;
+        for (const Annotation& annotation : annotations)
+        {
+            if (Access::is_default_argument(annotation))
+            {
+                has_annotation = true;
+                value = Access::default_argument_ref(annotation);
+                if (value.is_some())
+                {
+                    break;
+                }
+            }
+        }
+
+        if (value.is_none())
+        {
+            if (has_annotation)
+            {
+                return Error{ErrorKind::NotSupported,
+                             std::format("{}: the default value of parameter {} cannot be read on this compiler",
+                                         callee, i)};
+            }
+
+            return Error{ErrorKind::InvalidArgument,
+                         std::format("{}: parameter {} has no default_argument<T> annotation; supply all {} "
+                                     "required argument(s)",
+                                     callee, i, required_count)};
+        }
+
+        out.push_back(value.unwrap());
+    }
+
+    return None{};
+}
 
 inline auto accepts_argument(const Class* parameter, const TypeDescriptor* decay,
                              const ObjectRef& arg, bool explicit_choice) -> bool
@@ -4128,6 +4753,25 @@ template<typename T>
 auto clone_thunk(const void* data) -> void*
 {
     return new T(*static_cast<const T*>(data));
+}
+
+template<typename T>
+auto move_ctor_thunk(void* source) -> void*
+{
+    return new T(std::move(*static_cast<T*>(source)));
+}
+
+template<typename T>
+auto move_assign_thunk(void* object, void* value) -> bool
+{
+    *static_cast<T*>(object) = std::move(*static_cast<T*>(value));
+    return true;
+}
+
+template<typename T>
+auto swap_thunk(void* first, void* second) -> void
+{
+    std::swap(*static_cast<T*>(first), *static_cast<T*>(second));
 }
 
 template<meta::info M>
@@ -4956,6 +5600,13 @@ consteval auto held_annotation_ptr() -> const void*
 template<typename T>
 consteval auto annotation_type_descriptor() -> const TypeDescriptor*;
 
+/// Whether `type` (top-level const removed) is a specialization of
+/// `speculo::default_argument` (api_design §7).
+consteval auto is_default_argument_type(meta::info type) -> bool
+{
+    return meta::has_template_arguments(type) && meta::template_of(type) == ^^default_argument;
+}
+
 template<typename Source, std::size_t I>
 consteval auto make_annotation_desc() -> AnnotationDesc
 {
@@ -4965,6 +5616,18 @@ consteval auto make_annotation_desc() -> AnnotationDesc
     AnnotationDesc desc{};
     desc.type = annotation_type_descriptor<T>();
     desc.value = held_annotation_ptr<Source, I>();
+
+    if constexpr (is_default_argument_type(type))
+    {
+        desc.is_default_argument = true;
+        if constexpr (annotation_value_is_readable(type))
+        {
+            using Value = std::remove_cv_t<typename[: meta::template_arguments_of(type)[0] :]>;
+            desc.default_type = annotation_type_descriptor<Value>();
+            desc.default_value = std::addressof(HeldAnnotation<Source, I>::value.value);
+        }
+    }
+
     return desc;
 }
 
@@ -5042,12 +5705,23 @@ consteval auto make_field_desc(const TypeDescriptor* type, const TypeDescriptor*
     if (meta::is_reference_type(meta::type_of(M))) { mods |= Modifier::REFERENCE; }
     if (meta::is_const_type(meta::type_of(M)))     { mods |= Modifier::CONST; }
     if (meta::is_volatile_type(meta::type_of(M)))  { mods |= Modifier::VOLATILE; }
+    if constexpr (meta::is_static_member(M))
+    {
+        if (meta::has_thread_storage_duration(M))
+        {
+            mods |= Modifier::THREAD_LOCAL;
+        }
+    }
     desc.modifiers = mods;
 
     desc.is_bitfield = meta::is_bit_field(M);
     desc.is_static = meta::is_static_member(M);
     desc.is_mutable = meta::is_mutable_member(M);
     desc.is_reference = meta::is_reference_type(meta::type_of(M));
+    if constexpr (meta::is_static_member(M))
+    {
+        desc.is_thread_local = meta::has_thread_storage_duration(M);
+    }
 
     if (!desc.is_static)
     {
@@ -5169,6 +5843,115 @@ consteval auto result_is_boxable() -> bool
     }
 }
 
+/// Whether parameter I carries a `default_argument<T>` annotation.
+template<meta::info M, std::size_t I>
+consteval auto parameter_has_default() -> bool
+{
+    for (auto annotation : meta::annotations_of(meta::parameters_of(M)[I]))
+    {
+        if (is_default_argument_type(meta::remove_const(meta::type_of(annotation))))
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/// Leading parameters that must be supplied (C++ requires defaults to be trailing).
+template<meta::info M, std::size_t Count>
+consteval auto required_count_impl() -> std::size_t
+{
+    if constexpr (Count == 0)
+    {
+        return 0;
+    }
+    else if constexpr (parameter_has_default<M, Count - 1>())
+    {
+        return required_count_impl<M, Count - 1>();
+    }
+    else
+    {
+        return Count;
+    }
+}
+
+template<meta::info M>
+consteval auto required_parameter_count_of() -> std::size_t
+{
+    return required_count_impl<M, meta::parameters_of(M).size()>();
+}
+
+/// Conversion operator: `static_cast<R>(receiver)` is the only way to name the
+/// callee (its `type_of` is not a function type, so no member pointer exists).
+template<meta::info M, std::size_t... I>
+consteval auto make_invoker(std::index_sequence<I...>) -> InvokeFn;
+
+template<meta::info M, bool Rvalue>
+consteval auto make_conversion_invoker() -> InvokeFn
+{
+    using C = typename[: meta::parent_of(M) :];
+    using R = typename[: meta::return_type_of(M) :];
+
+    return +[](void* self, const void* const*) -> void*
+    {
+        auto* receiver = static_cast<C*>(self);
+        if constexpr (Rvalue)
+        {
+            return new std::remove_cvref_t<R>(static_cast<R>(std::move(*receiver)));
+        }
+        else
+        {
+            return new std::remove_cvref_t<R>(static_cast<R>(*receiver));
+        }
+    };
+}
+
+template<meta::info M>
+consteval auto make_conversion_ref_invoker() -> InvokeRefFn
+{
+    using C = typename[: meta::parent_of(M) :];
+    using R = typename[: meta::return_type_of(M) :];
+
+    return +[](void* self, const void* const*) -> const void*
+    {
+        auto* receiver = static_cast<C*>(self);
+        R result = static_cast<R>(*receiver);
+        return referent_address(result);
+    };
+}
+
+template<meta::info M, std::size_t... I>
+consteval auto make_rvalue_invoker(std::index_sequence<I...>) -> InvokeFn
+{
+    using F = typename[: meta::type_of(M) :];
+    using R = typename[: meta::return_type_of(M) :];
+
+    if constexpr (meta::is_static_member(M))
+    {
+        return make_invoker<M>(std::index_sequence<I...>{});
+    }
+    else
+    {
+        using C = typename[: meta::parent_of(M) :];
+        using MP = typename member_function_pointer<C, F>::type;
+        return +[](void* self, const void* const* args) -> void*
+        {
+            constexpr MP function = meta::extract<MP>(M);
+            auto* receiver = static_cast<C*>(self);
+            if constexpr (std::is_void_v<R>)
+            {
+                (std::move(*receiver).*function)(load_argument<M, I>(args)...);
+                return nullptr;
+            }
+            else
+            {
+                return new std::remove_cvref_t<R>((std::move(*receiver).*function)(load_argument<M, I>(args)...));
+            }
+        };
+    }
+}
+
 template<meta::info M, std::size_t... I>
 consteval auto make_invoker(std::index_sequence<I...>) -> InvokeFn
 {
@@ -5259,6 +6042,14 @@ consteval auto make_method_desc(const TypeDescriptor* declaring, const TypeDescr
     desc.parameter_types = parameters;
     desc.parameter_decays = parameter_decays;
     desc.parameter_count = parameter_count;
+    if constexpr (meta::is_deleted(M))
+    {
+        desc.required_parameter_count = parameter_count;
+    }
+    else
+    {
+        desc.required_parameter_count = required_parameter_count_of<M>();
+    }
 
     std::uint32_t mods = 0;
     if (meta::is_public(M))         { mods |= Modifier::PUBLIC; }
@@ -5270,6 +6061,8 @@ consteval auto make_method_desc(const TypeDescriptor* declaring, const TypeDescr
     if (meta::is_noexcept(M))       { mods |= Modifier::NOEXCEPT; }
     if (meta::is_deleted(M))        { mods |= Modifier::DELETED; }
     if (meta::is_defaulted(M))      { mods |= Modifier::DEFAULTED; }
+    if (meta::is_conversion_function(M)) { mods |= Modifier::CONVERSION; }
+    if (meta::is_vararg_function(M))     { mods |= Modifier::VARIADIC; }
     if (meta::is_virtual(M))
     {
         mods |= Modifier::VIRTUAL;
@@ -5283,31 +6076,23 @@ consteval auto make_method_desc(const TypeDescriptor* declaring, const TypeDescr
     else if (meta::is_rvalue_reference_qualified(M))  { desc.ref_qualifier = RefQualifier::Rvalue; }
 
     desc.is_destructor = meta::is_destructor(M);
+    desc.is_conversion = meta::is_conversion_function(M);
     desc.is_operator = !desc.is_destructor && meta::is_operator_function(M);
 
     if constexpr (meta::is_destructor(M))
     {
         // A destructor has no invokable member-function pointer via Method::invoke();
         // object destruction goes through Object's release() / Constructor::destroy_at().
-        desc.invoke = nullptr;
     }
     else if constexpr (meta::is_deleted(M))
     {
         // Listed, but there is nothing to call (and nothing to `extract`).
-        desc.invoke = nullptr;
     }
     else if constexpr (meta::is_vararg_function(M))
     {
         // A C variadic function (`...`) has no member-function-pointer
         // specialization and cannot be driven from a fixed argument array. The
         // fixed parameters are listed; the `...` only shows up in get_signature().
-        desc.invoke = nullptr;
-    }
-    else if constexpr (meta::is_rvalue_reference_qualified(M))
-    {
-        // `&&`-qualified member functions require an rvalue receiver; ObjectRef
-        // carries no value category, so they are reflected but not invokable.
-        desc.invoke = nullptr;
     }
     else
     {
@@ -5316,16 +6101,66 @@ consteval auto make_method_desc(const TypeDescriptor* declaring, const TypeDescr
         // A by-value move-only parameter would need a copy the type does not have.
         if constexpr (parameters_are_loadable<M>(indices))
         {
-            // A reference return of a move-only type cannot be boxed by copy, but
-            // invoke_ref() can still hand out the referent.
-            if constexpr (result_is_boxable<M>())
-            {
-                desc.invoke = make_invoker<M>(indices);
-            }
+            constexpr bool boxable = result_is_boxable<M>();
+            constexpr bool conversion = meta::is_conversion_function(M);
 
-            if constexpr (returns_reference<M>())
+            if constexpr (meta::is_rvalue_reference_qualified(M))
             {
-                desc.invoke_ref = make_ref_invoker<M>(indices);
+                // `&&`-qualified members: only the rvalue path exists.
+                if constexpr (boxable)
+                {
+                    if constexpr (conversion)
+                    {
+                        desc.invoke_rvalue = make_conversion_invoker<M, true>();
+                    }
+                    else
+                    {
+                        desc.invoke_rvalue = make_rvalue_invoker<M>(indices);
+                    }
+                }
+            }
+            else
+            {
+                // A reference return of a move-only type cannot be boxed by copy,
+                // but invoke_ref() can still hand out the referent.
+                if constexpr (boxable)
+                {
+                    if constexpr (conversion)
+                    {
+                        desc.invoke = make_conversion_invoker<M, false>();
+                    }
+                    else
+                    {
+                        desc.invoke = make_invoker<M>(indices);
+                    }
+                }
+
+                if constexpr (returns_reference<M>())
+                {
+                    if constexpr (conversion)
+                    {
+                        desc.invoke_ref = make_conversion_ref_invoker<M>();
+                    }
+                    else
+                    {
+                        desc.invoke_ref = make_ref_invoker<M>(indices);
+                    }
+                }
+
+                if constexpr (!meta::is_lvalue_reference_qualified(M))
+                {
+                    if constexpr (boxable)
+                    {
+                        if constexpr (conversion)
+                        {
+                            desc.invoke_rvalue = make_conversion_invoker<M, true>();
+                        }
+                        else
+                        {
+                            desc.invoke_rvalue = make_rvalue_invoker<M>(indices);
+                        }
+                    }
+                }
             }
         }
     }
@@ -5505,6 +6340,14 @@ consteval auto make_ctor_desc(const TypeDescriptor* declaring,
     desc.parameter_types = parameters;
     desc.parameter_decays = parameter_decays;
     desc.parameter_count = parameter_count;
+    if constexpr (meta::is_deleted(M))
+    {
+        desc.required_parameter_count = parameter_count;
+    }
+    else
+    {
+        desc.required_parameter_count = required_parameter_count_of<M>();
+    }
 
     std::uint32_t mods = 0;
     if (meta::is_public(M))         { mods |= Modifier::PUBLIC; }
@@ -5852,6 +6695,18 @@ consteval auto make_descriptor(const Class* self, const void* fields, std::size_
         if constexpr (meta::is_copy_constructible_type(C))
         {
             desc.clone = &clone_thunk<Self>;
+        }
+        if constexpr (std::is_move_constructible_v<Self>)
+        {
+            desc.move_ctor = &move_ctor_thunk<Self>;
+        }
+        if constexpr (std::is_move_assignable_v<Self>)
+        {
+            desc.move_assign = &move_assign_thunk<Self>;
+        }
+        if constexpr (std::is_move_constructible_v<Self> && std::is_move_assignable_v<Self>)
+        {
+            desc.swap = &swap_thunk<Self>;
         }
     }
 

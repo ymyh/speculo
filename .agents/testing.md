@@ -165,7 +165,7 @@ xmake run speculo_test --gtest_filter=FieldTest.*
 | **trait 交叉验证** | 布局/能力谓词（api_design §5） | 同一批类型上，`cls.is_trivially_copyable()` 必须等于 `std::is_trivially_copyable_v<T>`；覆盖空类、虚基、位域、`[[no_unique_address]]`、`std::string` 成员 |
 | **结论回归** | Phase 8 spike 的全部结论 | 每个 S8.x 定下的行为写一条断言，防止 GCC 升级悄悄改语义 |
 | **两路一致性** | 编译期半层（api_design §10） | `get_fields()` 与 `for_each_field` 的字段集合、顺序、名字必须完全一致 |
-| **布局静态断言** | `ObjectRef` / `Object` / 句柄 | `static_assert(sizeof(ObjectRef) == 16)`；加值类别后不变；`Class` 保持 8 字节 |
+| **布局静态断言** | `ObjectRef` / `Object` / 句柄 | `static_assert(sizeof(ObjectRef) == 24)`；加值类别后不变；`Class` 保持 8 字节 |
 | **分配计数** | 零分配与分配器（api_design §11–§12） | 计数 `Allocator`：`invoke_into` 断言 0 次分配，`invoke` 断言恰好 1 次 |
 | **golden 快照** | `describe()`（api_design §16） | 固定 fixture 的输出全文比对；改格式必须同时改快照 |
 | **负面用例** | 关系图、默认实参 | 未注册的派生类不可见；无注解形参调 `invoke_with_defaults` → `InvalidArgument` |

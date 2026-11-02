@@ -124,6 +124,18 @@ public:
         return detail::first_annotation<T>(get_parameter_annotations(index));
     }
 
+    /// The `default_argument<T>` annotation of parameter `index`, if any (api_design §7).
+    [[nodiscard]] auto get_parameter_default(std::size_t index) const -> Option<Annotation>
+    {
+        return detail::parameter_default(get_parameter_annotations(index));
+    }
+
+    /// Number of leading parameters that must be supplied (trailing defaults excluded).
+    [[nodiscard]] auto get_required_parameter_count() const -> std::size_t
+    {
+        return m_desc->required_parameter_count;
+    }
+
     /**
      * @brief Calls the function, boxing the return value (empty Object for void)
      *
@@ -192,7 +204,49 @@ public:
         const detail::TypeDescriptor* referent = m_desc->return_type->referenced;
 
         return detail::Access::view_object(address, m_desc->return_type->decayed, referent->is_const_qualified,
-                                           referent->is_volatile_qualified);
+                                           referent->is_volatile_qualified,
+                                           m_desc->return_type->reference_kind == RefQualifier::Rvalue
+                                               ? ValueCategory::Rvalue
+                                               : ValueCategory::Lvalue);
+    }
+
+    /**
+     * @brief Calls the function, filling trailing arguments from annotations
+     * @note Same check order as Method::invoke_with_defaults() (api_design §7).
+     */
+    [[nodiscard]] auto invoke_with_defaults(Args args = {}) const -> Outcome<Object>
+    {
+        const std::size_t count = m_desc->parameter_count;
+        if (args.size() > count)
+        {
+            return Error{ErrorKind::InvalidArgument,
+                         std::format("{}: expected at most {} argument(s), got {}",
+                                     context("Function::invoke_with_defaults"), count, args.size())};
+        }
+
+        if (args.size() < m_desc->required_parameter_count)
+        {
+            return Error{ErrorKind::InvalidArgument,
+                         std::format("{}: expected at least {} argument(s), got {}",
+                                     context("Function::invoke_with_defaults"), m_desc->required_parameter_count,
+                                     args.size())};
+        }
+
+        if (args.size() == count)
+        {
+            return invoke(std::move(args));
+        }
+
+        std::vector<ObjectRef> all;
+        const Status appended = detail::append_default_arguments(
+            context("Function::invoke_with_defaults"), all, args, count, m_desc->required_parameter_count,
+            [this](std::size_t index) { return get_parameter_annotations(index); });
+        if (appended.is_err())
+        {
+            return appended.unwrap_err();
+        }
+
+        return invoke(detail::make_args(std::span<const ObjectRef>(all)));
     }
 
     [[nodiscard]] auto operator==(const Function& other) const noexcept -> bool { return m_desc == other.m_desc; }
@@ -388,6 +442,14 @@ consteval auto make_function_desc(const Class* const* parameters, const TypeDesc
     desc.parameter_types = parameters;
     desc.parameter_decays = parameter_decays;
     desc.parameter_count = meta::parameters_of(F).size();
+    if constexpr (meta::is_deleted(F))
+    {
+        desc.required_parameter_count = desc.parameter_count;
+    }
+    else
+    {
+        desc.required_parameter_count = required_parameter_count_of<F>();
+    }
 
     std::uint32_t mods = 0;
     if (meta::is_noexcept(F))
@@ -397,6 +459,10 @@ consteval auto make_function_desc(const Class* const* parameters, const TypeDesc
     if (meta::is_deleted(F))
     {
         mods |= Modifier::DELETED;
+    }
+    if (meta::is_vararg_function(F))
+    {
+        mods |= Modifier::VARIADIC;
     }
     desc.modifiers = mods;
 

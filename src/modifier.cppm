@@ -43,6 +43,15 @@ public:
     static constexpr std::uint32_t DELETED   = 1u << 20;
     static constexpr std::uint32_t OVERRIDE  = 1u << 21;
 
+    // ── v2 additions (api_design §9); the v1 bit values above stay unchanged ──
+    static constexpr std::uint32_t THREAD_LOCAL      = 1u << 22; ///< static thread_local data member
+    /// Reserved, never set: GCC 16.2's <meta> has no predicate for a declared
+    /// member's `[[no_unique_address]]` (data_member_options only applies to
+    /// define_aggregate). The bit position stays stable for a future compiler.
+    static constexpr std::uint32_t NO_UNIQUE_ADDRESS = 1u << 23;
+    static constexpr std::uint32_t CONVERSION        = 1u << 24; ///< conversion operator (`operator T`)
+    static constexpr std::uint32_t VARIADIC          = 1u << 25; ///< C-style variadic function (`...`)
+
     constexpr Modifier() noexcept = default;
 
     constexpr explicit Modifier(std::uint32_t bits) noexcept
@@ -70,6 +79,9 @@ public:
     [[nodiscard]] constexpr auto is_defaulted() const noexcept -> bool { return has(DEFAULTED); }
     [[nodiscard]] constexpr auto is_deleted() const noexcept -> bool { return has(DELETED); }
     [[nodiscard]] constexpr auto is_override() const noexcept -> bool { return has(OVERRIDE); }
+    [[nodiscard]] constexpr auto is_thread_local() const noexcept -> bool { return has(THREAD_LOCAL); }
+    [[nodiscard]] constexpr auto is_conversion() const noexcept -> bool { return has(CONVERSION); }
+    [[nodiscard]] constexpr auto is_variadic() const noexcept -> bool { return has(VARIADIC); }
 
     /**
      * @brief Space-separated list of active modifier names (Java style)
@@ -105,6 +117,9 @@ public:
         if (is_defaulted()) { append("defaulted"); }
         if (is_deleted())   { append("deleted"); }
         if (is_override())  { append("override"); }
+        if (is_thread_local()) { append("thread_local"); }
+        if (is_conversion())   { append("conversion"); }
+        if (is_variadic())     { append("variadic"); }
 
         return result;
     }

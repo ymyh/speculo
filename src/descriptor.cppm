@@ -19,6 +19,9 @@ namespace speculo::detail
 using ReleaseFn       = void (*)(void*);                ///< destroy in place and free heap storage
 using DestroyFn       = void (*)(void*);                ///< destroy in place only
 using CloneFn         = void* (*)(const void*);         ///< allocate and copy-construct
+using MoveCtorFn      = void* (*)(void*);               ///< allocate and move-construct from a mutable source
+using MoveAssignFn    = bool (*)(void*, void*);         ///< move-assign a value into an existing object
+using SwapFn          = void (*)(void*, void*);         ///< exchange two objects of the same type in place
 using FieldGetFn      = void* (*)(const void*);         ///< heap copy of a member value
 using FieldSetFn      = bool (*)(void*, const void*);   ///< copy-assign a member value
 using FieldRefFn      = void* (*)(void*);               ///< address of a subobject
@@ -74,6 +77,13 @@ struct AnnotationDesc
 {
     const TypeDescriptor* type = nullptr;
     const void* value = nullptr;
+    /// True when this annotation is `speculo::default_argument<T>` (api_design §7).
+    bool is_default_argument = false;
+    /// For a readable default_argument<T>: T's descriptor and a pointer to the
+    /// static `T` held inside the annotation value. Both stay null when the
+    /// annotation value cannot be extracted on this compiler.
+    const TypeDescriptor* default_type = nullptr;
+    const void* default_value = nullptr;
 };
 
 struct Access; ///< the one door to the handles' private internals (defined in `speculo:object`)
@@ -135,6 +145,7 @@ struct FieldDesc
     bool is_static = false;
     bool is_mutable = false;
     bool is_reference = false;
+    bool is_thread_local = false; ///< static thread_local data member
 
     FieldGetFn get = nullptr;
     FieldSetFn set = nullptr;
@@ -156,13 +167,18 @@ struct MethodDesc
     const Class* const* parameter_types = nullptr;
     const TypeDescriptor* const* parameter_decays = nullptr; ///< cv/ref-normalized parameter types
     std::size_t parameter_count = 0;
+    /// Number of leading parameters that must be supplied: trailing parameters
+    /// carrying a `default_argument<T>` annotation are optional (api_design §7).
+    std::size_t required_parameter_count = 0;
     std::uint32_t modifiers = 0;
     RefQualifier ref_qualifier = RefQualifier::None;
-    bool is_operator = false;   ///< operator+ / operator= / conversion operator / ...
+    bool is_operator = false;   ///< operator+ / operator= / ... (conversion operators: see is_conversion)
     bool is_destructor = false; ///< user-declared destructor (not invokable via invoke())
+    bool is_conversion = false; ///< `operator T` (also carries Modifier::CONVERSION)
 
     InvokeFn invoke = nullptr;          ///< boxes a copy of the result (nullptr when it cannot be boxed)
     InvokeRefFn invoke_ref = nullptr;   ///< reference-returning methods only: address of the referent, no copy
+    InvokeFn invoke_rvalue = nullptr;   ///< rvalue receiver path; `&&`-qualified methods only have this one
 
     const void* annotations = nullptr; ///< const Annotation[] on the function itself
     std::size_t annotation_count = 0;
@@ -187,7 +203,8 @@ struct FunctionDesc
     const Class* const* parameter_types = nullptr;
     const TypeDescriptor* const* parameter_decays = nullptr;
     std::size_t parameter_count = 0;
-    std::uint32_t modifiers = 0; ///< NOEXCEPT / DELETED only
+    std::size_t required_parameter_count = 0; ///< leading parameters without a default_argument annotation
+    std::uint32_t modifiers = 0; ///< NOEXCEPT / DELETED / VARIADIC
     bool is_operator = false;
     bool is_variadic = false;         ///< C-style `...`; only the fixed parameters are listed
     bool has_canonical_name = false;  ///< false for internal linkage: invokable, not registered
@@ -216,6 +233,7 @@ struct CtorDesc
     const Class* const* parameter_types = nullptr;
     const TypeDescriptor* const* parameter_decays = nullptr; ///< cv/ref-normalized parameter types
     std::size_t parameter_count = 0;
+    std::size_t required_parameter_count = 0; ///< leading parameters without a default_argument annotation
     std::uint32_t modifiers = 0;
     bool is_copy = false; ///< copy constructor
     bool is_move = false; ///< move constructor
@@ -320,6 +338,9 @@ struct TypeDescriptor
     ReleaseFn release = nullptr;    ///< owning destruction (delete)
     DestroyFn destroy = nullptr;    ///< in-place destruction
     CloneFn   clone = nullptr;      ///< nullptr when the type is not copy-constructible
+    MoveCtorFn   move_ctor = nullptr;   ///< nullptr when the type is not move-constructible
+    MoveAssignFn move_assign = nullptr; ///< nullptr when the type is not move-assignable
+    SwapFn       swap = nullptr;        ///< nullptr unless move-constructible and move-assignable
 
     const void* fields = nullptr;   ///< const Field[] (public members, own class)
     std::size_t field_count = 0;

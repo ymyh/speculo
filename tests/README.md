@@ -21,6 +21,10 @@ comment above the loop, and every cell of the product is asserted:
 | `CastMatrix` | `inheritance_test.cpp` | target base × receiver constness (5 × 2) |
 | `EnumConversionMatrix` | `enumerator_test.cpp` | enum × conversion (4 × 6) |
 | `CallableInvokeMatrix` | `callable_test.cpp` | receiver form × argument form (4 × 3, error precedence) |
+| `ValueCategoryTest` matrix | `value_category_test.cpp` | ObjectRef view × operation (6 × 3), receiver × arguments (6 × 2 / 6 × 1) |
+| `Class::assign` matrix | `move_test.cpp` | destination form × source form (5 × 6); swap 5 × 5; move_from 3 × 2 |
+| `invoke_with_defaults` matrix | `default_argument_test.cpp` | receiver × argument form (5 × 6); arity 4 each |
+| `Field::is_thread_local` / `get_static_address` matrix | `storage_test.cpp` | member kind × query (5 × 2) |
 | `IntBindingMatrix`, `NumericExactMatchMatrix`, `PointerBindingMatrix`, `BoxBindingMatrix`, `OptionStateMatrix`, `ResultStateMatrix` | `function_test.cpp` | free-function arguments / return kinds |
 
 The precedence tables (`MethodInvokeMatrix`, `FieldSetMatrix`, `ClassMethodLookupMatrix`)
@@ -57,6 +61,10 @@ from per-row data, so their tables are written literally next to the loop.
 | `nested_type_test.cpp` | `Class::get_declared_classes`, `get_enclosing_class` |
 | `layout_traits_test.cpp` | Layout / capability predicates, cross-checked against `<type_traits>` |
 | `base_offset_test.cpp` | `BaseClass::get_offset`, cross-checked against `cast_to` |
+| `value_category_test.cpp` | `ValueCategory`, `ObjectRef::as_rvalue` / `as_lvalue`, `Method::invoke_rvalue` |
+| `move_test.cpp` | `Class::assign` / `swap` / `destroy`, `Object::move_from` |
+| `default_argument_test.cpp` | `default_argument<T>`, `get_parameter_default`, `invoke_with_defaults` |
+| `storage_test.cpp` | `Field::is_thread_local` / `get_static_address`, conversion / variadic modifiers |
 | `cross_tu_support.cpp` | Support TU for the cross-translation-unit function test |
 
 ## Shared fixtures

@@ -14,11 +14,12 @@
 `Enumerator` / `BaseClass` / `Array` / `Modifier`、双视图成员访问、三级查找、继承与 `cast_to`、
 注册表与 `SPECULO_IMPL` 家族。CMake 与 xmake 双系统全绿。
 
-**测试现状**：268 个用例（CMake 全绿，`ctest` 5/5；xmake 同样 5/5）。v1 的测试已按
+**测试现状**：309 个用例（CMake 全绿，`ctest` 5/5；xmake 同样 5/5）。v1 的测试已按
 @.agents/testing.md §2–§5 对齐，**7 张组合矩阵**覆盖 `Method::invoke`（5 × 5）、`Field::set`
 （5 × 5）、`Class::get_method`（5 × 4）、`Constructor::new_instance`（5 × 5）、`Array` 操作
 （5 × 4 + Option 列）、`cast_to`（5 × 2）、枚举三向互转（4 × 6），`Function` 侧的 6 张沿用；
-Phase 9 又加了 `Callable::invoke` 的接收者 × 实参表。错误优先级（api_design §0.1）由矩阵中
+Phase 9 又加了 `Callable::invoke` 的接收者 × 实参表，Phase 10 加了值类别 / `Class::assign` /
+`invoke_with_defaults` / 存储期四张表。错误优先级（api_design §0.1）由矩阵中
 「同时两个错」的格子钉住。前 3 张的期望值由 `tools/gen_matrix.py` 枚举生成，其余按行内
 数据表。9 个句柄各自的「空句柄 → `panic`」死亡用例也已补齐（共 15 个 `EXPECT_DEATH`，
 约占 9 s 跑时，属预期开销）。
@@ -126,22 +127,28 @@ Phase 9 又加了 `Callable::invoke` 的接收者 × 实参表。错误优先级
 函数指针字段可 `invoke`；POD 配置结构可 `new_aggregate`；`Outer::Inner` 可从 `Outer` 取到；
 布局谓词对 10 个代表性类型与编译器内建 trait 交叉验证一致。
 
-## Phase 10：操作语义（3~4 天）
+## Phase 10：操作语义（3~4 天）—— ✅ 已完成（2026-11-02）
 
 目标：把 C++ 的对象语义（值类别、移动、默认实参、存储期）落进 API。对应 api_design §7–§9。
 
-- [ ] `ValueCategory` + `ObjectRef::value_category` / `as_rvalue` / `as_lvalue`
-  （塞进既有 flags，**16 字节布局不变**，加静态断言）
-- [ ] `Method::invoke_rvalue` / `Function::invoke_rvalue` / `is_rvalue_invokable`；
-  `&&` 限定成员函数从此可用
-- [ ] 移动 thunk：`MoveCtorFn` / `MoveAssignFn` / `SwapFn`；`Class::assign` / `swap` / `destroy`；
+> 落地记录与实现偏差见 `review.md`「Phase 10」。与下文清单的三处不同：
+> `Function` **没有** `invoke_rvalue`（自由函数无接收者）；`Class` **没有**
+> `is_thread_local` / `get_static_address`（只有静态数据成员有存储期，收窄到 `Field`）；
+> `Modifier::NO_UNIQUE_ADDRESS` 保留位但永不置位（GCC 16.2 无检测谓词）。
+
+- [x] `ValueCategory` + `ObjectRef::value_category` / `as_rvalue` / `as_lvalue`
+  （塞进既有 flags，**24 字节布局不变**，加静态断言；设计文档早期写的 16 字节已更正）
+- [x] `Method::invoke_rvalue` / `is_rvalue_invokable`；`&&` 限定成员函数从此可用，
+  `&` 限定方法在右值路径返回 `NotSupported`
+- [x] 移动 thunk：`MoveCtorFn` / `MoveAssignFn` / `SwapFn`；`Class::assign` / `swap` / `destroy`；
   `Object::move_from`
-- [ ] 默认实参：`default_argument<T>` 注解 + `get_parameter_default` /
-  `get_required_parameter_count` / `invoke_with_defaults`（只补尾部）
-- [ ] 存储期与剩余修饰：`is_thread_local` / `get_static_address`；
-  `Modifier::THREAD_LOCAL` / `NO_UNIQUE_ADDRESS` / `CONVERSION` / `VARIADIC`；
+- [x] 默认实参：`default_argument<T>` 注解 + `get_parameter_default` /
+  `get_required_parameter_count` / `invoke_with_defaults`（只补尾部；`Method` /
+  `Constructor` / `Function` 三处）
+- [x] 存储期与剩余修饰：`Field::is_thread_local` / `get_static_address`；
+  `Modifier::THREAD_LOCAL` / `NO_UNIQUE_ADDRESS`（保留不置位）/ `CONVERSION` / `VARIADIC`；
   `Method::is_conversion_operator` / `get_conversion_type` / `is_variadic`
-- [ ] 测试：`tests/value_category_test.cpp` / `move_test.cpp` / `default_argument_test.cpp` /
+- [x] 测试：`tests/value_category_test.cpp` / `move_test.cpp` / `default_argument_test.cpp` /
   `storage_test.cpp`；`ObjectRef` 布局静态断言
 
 **验收**：`std::unique_ptr` 字段可在右值视图下 move；`&&` 限定成员函数可调用；

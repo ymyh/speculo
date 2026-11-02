@@ -303,8 +303,9 @@ v2 新增 `speculo:compile` 分区，放在分层图的最上层旁边，**不�
 
 ### 15.1 值类别进 `ObjectRef`
 
-`ObjectRef` 现在 16 字节：`const void* data` + `const TypeDescriptor* type`，
-const/volatile 状态另存。v2 把 **value category** 放进同一批标志位，**布局不变**。
+`ObjectRef` 现在是 24 字节：`const void* data` + `const TypeDescriptor* type` +
+const/volatile/rvalue 三个 `bool`（尾部填充）。v2 把 **value category** 放进同一批标志位，
+**布局不变**（仍是 24 字节）。
 
 - `ObjectRef::as_rvalue()` 只是打标记，不搬数据。
 - `Method::invoke` 的默认语义不变（接收者左值）；新增 `invoke_rvalue` 走右值路径，
