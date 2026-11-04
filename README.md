@@ -41,7 +41,7 @@ int main()
 - GCC 16 or newer. It is the compiler that implements `-freflection`.
 - C++26, with `import std;`.
 - CMake 3.31 or newer and the Ninja generator, or xmake.
-- [crab_cpp](https://github.com/ymyh/crab-cpp) 0.4.0, fetched automatically.
+- [crab_cpp](https://github.com/ymyh/crab-cpp) 0.4.1, fetched automatically.
 
 Your own targets that `import speculo;` must also be built with `-std=c++26 -freflection -fno-rtti -fno-exceptions`.
 

@@ -592,6 +592,24 @@ private:
     ObjectRef   m_ref;
 };
 
+namespace detail
+{
+
+/**
+ * @brief A contiguous sequence whose elements already are ObjectRef views
+ *
+ * Such a sequence is an argument *list*, not one argument: Args views it
+ * element-wise (see the sequence constructor below). The variadic constructor
+ * excludes these types, otherwise `invoke(obj, refs)` would bind `refs` as a
+ * single argument -- binding to `Ts&` beats binding to `const std::vector&`, so
+ * overload resolution would silently prefer the one-argument reading.
+ */
+template<typename T>
+concept object_ref_sequence = std::ranges::contiguous_range<T>
+                           && std::same_as<std::remove_cv_t<std::ranges::range_value_t<T>>, ObjectRef>;
+
+} // namespace detail
+
 /**
  * @brief Small-object-optimized collection of ObjectRef arguments
  *
@@ -599,6 +617,16 @@ private:
  * back to a heap-allocated std::vector. Args only stores views -- the callers
  * must keep the referenced objects alive. Temporaries written inside the braced
  * list (see Arg) live until the end of the full-expression, i.e. through the call.
+ *
+ * A list written in place ({a, b, c}) is not the only source: an Args can also be
+ * assembled at run time from any contiguous sequence of ObjectRef -- a
+ * std::vector, a std::span (mutable or const), a std::array or a C array -- and
+ * passed straight to invoke / new_instance. Only the ObjectRef handles are copied,
+ * so the container itself may be a temporary; the referenced objects must still
+ * outlive the call.
+ *
+ * Such a sequence is always an argument *list*: invoke(obj, refs) passes its
+ * elements, never the container as one argument.
  */
 class Args
 {
@@ -631,6 +659,7 @@ public:
     /// Views any mix of convertible arguments (Object, concrete T&, ...).
     template<typename... Ts>
         requires (sizeof...(Ts) > 0) && (std::convertible_to<Ts&, ObjectRef> && ...)
+                 && (!detail::object_ref_sequence<std::remove_cvref_t<Ts>> && ...)
     Args(Ts&... objs)
     {
         constexpr std::size_t count = sizeof...(Ts);
@@ -645,6 +674,16 @@ public:
             m_heap = new std::vector<ObjectRef>{ static_cast<ObjectRef>(objs)... };
             m_size = count;
         }
+    }
+
+    /// Views an already-built sequence of references (run-time assembled arguments).
+    /// Accepts std::vector<ObjectRef>, std::span<ObjectRef>, std::span<const
+    /// ObjectRef>, std::array<ObjectRef, N> and ObjectRef[N]; only the handles are
+    /// copied into Args, so the sequence itself may be a temporary.
+    template<detail::object_ref_sequence Sequence>
+    Args(const Sequence& refs)
+    {
+        assign_refs(std::span<const ObjectRef>(refs));
     }
 
     Args(Args&& other) noexcept
@@ -711,8 +750,8 @@ public:
 private:
     static constexpr std::size_t kInlineCapacity = 8;
 
-    /// Internal: views an already-built sequence (used to append default arguments).
-    explicit Args(std::span<const ObjectRef> refs)
+    /// Copies the handles of an already-built sequence into Args' own storage.
+    auto assign_refs(std::span<const ObjectRef> refs) -> void
     {
         if (refs.size() <= kInlineCapacity)
         {
@@ -5299,7 +5338,7 @@ consteval auto max_parameters() -> std::size_t
  */
 consteval auto is_interface_class(meta::info C) -> bool
 {
-    if (!meta::is_class_type(C) || !meta::is_abstract_type(C) || is_std_type(C))
+    if (!meta::is_class_type(C) || !meta::is_abstract_type(C) || is_shallow_type(C))
     {
         return false;
     }
@@ -6505,6 +6544,33 @@ consteval auto result_is_boxable() -> bool
     }
 }
 
+// Whether a listed copy / move assignment can actually be called.
+//
+// `= default` on an assignment operator whose implicit definition is deleted (a
+// move-only payload in a variant-like member, e.g. Option<Object> /
+// Result<Object, Error>) is not reported as deleted through std::meta by GCC
+// 16.2: instantiating the thunk's call instead fails while defining the
+// defaulted operator, which is a hard error inside the constexpr table. The
+// standard traits answer without instantiating that definition, so they are the
+// guard: an uncallable assignment stays listed with null thunks, and invoke()
+// reports NotSupported for it, exactly like a deleted member.
+template<meta::info M>
+consteval auto assignment_is_available() -> bool
+{
+    if constexpr (meta::is_copy_assignment(M))
+    {
+        return std::is_copy_assignable_v<typename[: meta::parent_of(M) :]>;
+    }
+    else if constexpr (meta::is_move_assignment(M))
+    {
+        return std::is_move_assignable_v<typename[: meta::parent_of(M) :]>;
+    }
+    else
+    {
+        return true;
+    }
+}
+
 /// Whether parameter I carries a `default_argument<T>` annotation.
 template<meta::info M, std::size_t I>
 consteval auto parameter_has_default() -> bool
@@ -6764,7 +6830,20 @@ consteval auto make_method_desc(const TypeDescriptor* declaring, const TypeDescr
     desc.parameter_types = parameters;
     desc.parameter_decays = parameter_decays;
     desc.parameter_count = parameter_count;
-    if constexpr (meta::is_deleted(M))
+
+    // The traits must be asked before std::meta::is_deleted: for a defaulted
+    // assignment whose implicit definition is deleted (a move-only payload, e.g.
+    // Option<Object> / Result<Object, Error>), GCC 16.2 instantiates that
+    // definition to answer is_deleted, and the instantiation is a hard error.
+    // assignment_is_available() answers without instantiating it, and "not
+    // assignable" is exactly the case where the default is deleted, so the member
+    // is still reported as deleted -- it just keeps null thunks.
+    constexpr bool defaulted = meta::is_defaulted(M);
+    constexpr bool assignable = assignment_is_available<M>();
+    constexpr bool deleted = !defaulted ? meta::is_deleted(M)
+                                        : (!assignable || meta::is_deleted(M));
+
+    if constexpr (deleted)
     {
         desc.required_parameter_count = parameter_count;
     }
@@ -6781,8 +6860,8 @@ consteval auto make_method_desc(const TypeDescriptor* declaring, const TypeDescr
     if (meta::is_volatile(M))       { mods |= Modifier::VOLATILE; }
     if (meta::is_static_member(M))  { mods |= Modifier::STATIC; }
     if (meta::is_noexcept(M))       { mods |= Modifier::NOEXCEPT; }
-    if (meta::is_deleted(M))        { mods |= Modifier::DELETED; }
-    if (meta::is_defaulted(M))      { mods |= Modifier::DEFAULTED; }
+    if (deleted)                    { mods |= Modifier::DELETED; }
+    if (defaulted)                  { mods |= Modifier::DEFAULTED; }
     if (meta::is_conversion_function(M)) { mods |= Modifier::CONVERSION; }
     if (meta::is_vararg_function(M))     { mods |= Modifier::VARIADIC; }
     if (meta::is_virtual(M))
@@ -6806,7 +6885,7 @@ consteval auto make_method_desc(const TypeDescriptor* declaring, const TypeDescr
         // A destructor has no invokable member-function pointer via Method::invoke();
         // object destruction goes through Object's release() / Constructor::destroy_at().
     }
-    else if constexpr (meta::is_deleted(M))
+    else if constexpr (deleted)
     {
         // Listed, but there is nothing to call (and nothing to `extract`).
     }
@@ -7334,7 +7413,7 @@ consteval auto dynamic_array_name(bool simple) -> std::string_view
 template<meta::info E>
 consteval auto enumerator_count() -> std::size_t
 {
-    if constexpr (meta::is_enum_type(E) && (!is_std_type(E) || is_deep_type<E>()))
+    if constexpr (meta::is_enum_type(E) && (!is_shallow_type(E) || is_deep_type<E>()))
     {
         return meta::enumerators_of(E).size();
     }

@@ -116,3 +116,94 @@ TEST(StdLibraryTest, AnonymousUnionMembersAreReflectable)
     EXPECT_EQ(sub.type(), union_type);
     EXPECT_EQ(as_int.get(sub).unwrap().as<int>().unwrap(), 7);
 }
+
+namespace
+{
+
+// A user type whose field is a sequence of the library's own reference handle.
+struct ArgsHolder
+{
+    std::vector<speculo::ObjectRef> arguments;
+
+    auto count() const -> int { return static_cast<int>(arguments.size()); }
+};
+
+} // namespace
+
+TEST(StdLibraryTest, ThirdPartyTypesAreDeep)
+{
+    // Only `std` is shallow. crab_cpp is a third-party library from speculo's
+    // point of view, so its types are described like any user type -- including
+    // Option<Object> / Result<Object, Error>, whose copy assignment is deleted for
+    // a move-only payload, and Result<const T&, const E&> (as_ref's return type).
+    static_assert(!std::is_copy_assignable_v<crab_cpp::Option<speculo::Object>>);
+    static_assert(!std::is_copy_assignable_v<crab_cpp::Result<speculo::Object, speculo::Error>>);
+    static_assert(std::is_move_assignable_v<crab_cpp::Result<speculo::Object, speculo::Error>>);
+
+    const speculo::Class& option = speculo::class_of<crab_cpp::Option<speculo::Object>>();
+    EXPECT_EQ(option.get_size(), sizeof(crab_cpp::Option<speculo::Object>));
+    EXPECT_EQ(option.get_alignment(), alignof(crab_cpp::Option<speculo::Object>));
+    EXPECT_FALSE(option.get_qualified_name().empty());
+    EXPECT_FALSE(option.get_methods().empty());
+
+    const speculo::Class& result = speculo::class_of<crab_cpp::Result<speculo::Object, speculo::Error>>();
+    EXPECT_EQ(result.get_size(), sizeof(crab_cpp::Result<speculo::Object, speculo::Error>));
+    EXPECT_FALSE(result.get_methods().empty());
+
+    // The reference-payload twin is materializable too (it used to instantiate an
+    // ill-formed std::variant through as_ref()).
+    const speculo::Class& reference_result =
+        speculo::class_of<crab_cpp::Result<const speculo::Object&, const speculo::Error&>>();
+    EXPECT_FALSE(reference_result.get_methods().empty());
+
+    // The copy assignment is listed as deleted, with no thunks behind it.
+    std::size_t deleted = 0;
+    for (const speculo::Method& method : result.get_methods())
+    {
+        if (method.is_deleted())
+        {
+            ++deleted;
+            EXPECT_FALSE(method.is_invokable());
+        }
+    }
+    EXPECT_EQ(deleted, 1u);
+
+    // The value operations an Object needs still work.
+    speculo::Object empty = speculo::Object::from_value(crab_cpp::Option<speculo::Object>(speculo::None{})).unwrap();
+    EXPECT_TRUE(empty.as<crab_cpp::Option<speculo::Object>>().unwrap().is_none());
+}
+
+TEST(StdLibraryTest, HandleTypesStillExpandTheirMembers)
+{
+    // Materialization stops at `std`, not at every type the closure reaches:
+    // speculo's own handles stay fully described.
+    const speculo::Class& ref = speculo::class_of<speculo::ObjectRef>();
+    EXPECT_FALSE(ref.get_methods().empty());
+    EXPECT_FALSE(speculo::class_of<speculo::Annotation>().get_methods().empty());
+    EXPECT_FALSE(speculo::class_of<speculo::Class>().get_methods().empty());
+}
+
+TEST(StdLibraryTest, ObjectRefSequenceAsAFieldIsReflectable)
+{
+    // The field type drags ObjectRef -> Class -> Annotation -> Outcome<Object>
+    // into the closure; it is materializable only because crab_cpp's own default
+    // members are valid (crab_cpp 0.4.1).
+    const speculo::Class& holder = speculo::class_of<ArgsHolder>();
+    ASSERT_EQ(holder.get_fields().size(), 1u);
+
+    const speculo::Field field = holder.get_field("arguments").unwrap();
+    EXPECT_EQ(field.get_type(), speculo::class_of<std::vector<speculo::ObjectRef>>());
+
+    int first = 1;
+    ArgsHolder value;
+    value.arguments.push_back(speculo::ObjectRef(first));
+    EXPECT_EQ(value.count(), 1);
+
+    auto read = field.get(value);
+    ASSERT_TRUE(read.is_ok());
+    EXPECT_EQ(std::move(read).unwrap().as<std::vector<speculo::ObjectRef>>().unwrap().size(), 1u);
+
+    std::vector<speculo::ObjectRef> replacement;
+    ASSERT_TRUE(field.set(value, replacement).is_ok());
+    EXPECT_EQ(value.count(), 0);
+}

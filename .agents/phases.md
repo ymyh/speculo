@@ -32,7 +32,7 @@ Phase 9 又加了 `Callable::invoke` 的接收者 × 实参表，Phase 10 加了
 - 编译器 **GCC >= 16**，开关 **`-freflection -fno-rtti -fno-exceptions`**。
 - 全项目禁用异常与 RTTI：错误一律 `crab_cpp::Option` / `Result`；源码禁止 `throw` / `try` /
   `catch` / `typeid` / `dynamic_cast`；`libspeculo.a` 中不得出现 `__cxa` / `type_info` 符号。
-- 依赖 `crab_cpp`（模块，v0.4.0）。CMake（Ninja + `CMAKE_EXPERIMENTAL_CXX_IMPORT_STD`）与
+- 依赖 `crab_cpp`（模块，v0.4.1）。CMake（Ninja + `CMAKE_EXPERIMENTAL_CXX_IMPORT_STD`）与
   xmake 双系统对等；新增模块分区必须同时更新 `CMakeLists.txt` 的 `CXX_MODULES` 与 `xmake.lua`。
 - 测试：CMake 用 `file(GLOB_RECURSE)`（非 `CONFIGURE_DEPENDS`）→ 新增测试文件后要重新 configure。
 

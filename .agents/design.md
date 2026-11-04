@@ -98,6 +98,7 @@ Java 里一切皆堆对象、有 GC；C++ 不行，因此区分两种类型擦�
 - **`Object`**：owning。类似带类型描述的 `std::any`：内部保存值存储（SSO 可选，初版直接堆分配）+ 指向 `TypeDescriptor` 的指针，析构时通过 descriptor 里的 dtor thunk 销毁。拷贝/移动是否可用取决于被包类型是否支持（描述表中有相应 thunk，缺失则返回 `ErrorKind::NotSupported`）。
 - **`ObjectRef`**：non-owning。`void*` + `const Class*`，用于指向已有对象或其子对象（字段 `get_ref` 的结果、数组元素等）。生命周期由调用者保证，文档中明确标注。
 - **`Args`**：实参集合（`ObjectRef` 的 SSO 容器，内联 8 个、超出堆分配）。解决 `std::span<const ObjectRef>` 无法从 `Object` 隐式构造的问题；`invoke` / `new_instance` / `construct_at` 统一收 `Args`，调用端直接写 `invoke(obj, {a, b, c})` 即可混合传 `Object`、具体类型引用等一切可转 `ObjectRef` 的东西。
+  实参也可以在运行期拼装：任何元素为 `ObjectRef` 的连续序列（`std::vector` / `std::span` / `std::array` / C 数组）都可隐式转成 `Args`，直接写 `method.invoke(obj, refs)`。构造时只拷贝 `ObjectRef` 句柄（≤ 8 个不分配），所以容器本身可以是临时值，但被引用的对象仍须活到调用结束。这种序列**一律按实参列表**解释，不会被当成「一个容器实参」；元素个数仍须与形参表精确匹配——这不是 Java 的 `Object...`。
 
 调用链统一走 `ObjectRef`：`Method::invoke(ObjectRef self, Args)`、`Field::get(ObjectRef)`；`Object` 可隐式转出 `ObjectRef`。
 
@@ -211,11 +212,8 @@ speculo/
 4. 无默认构造/不可拷贝类型的 `Object` 拷贝、数组 `Array::newInstance` 等操作在运行期报 `NotSupported`（thunk 为 nullptr 即能力缺失标志）。
 5. 函数局部类型、匿名命名空间类型可反射但无法注册到全局表（名字不可寻址），`for_name` 查不到属预期行为。
 6. 不反射：模板本身、宏、typedef/别名（别名直接解析到底层类型，`using` 信息丢失属预期）。
-7. **`std` 类型浅物化**：声明在命名空间 `std`（含 `std::__cxx11` 等内联命名空间）里的类、联合、枚举只保留身份和值操作（名字、大小、对齐、拷贝/析构/赋值，以及 `Object` 装箱所需的 thunk），**不枚举**其字段、方法、构造函数、基类、枚举项。用户类型里的 `std::string` 字段、以及签名用到 `std::` 类型的成员函数，仍然正常反射、可 `get` / `set` / `get_ref` / `invoke`；只是不能再通过 `class_of<std::string>()` 去调用 `size()` 这类标准库成员。这是为了避免一个 `std::string` 成员把 `basic_string` 的整棵签名闭包编进程序。
-8. **反射库类型（尤其类模板特化）可能不可物化**：物化会为每个成员函数生成 invoker（`extract` 成员指针），
-   这会实例化其函数体。若某特化的成员函数体对其自身无效（典型：`Option<move-only T>::or_` 内 `return *this;`
-   需要拷贝），物化即硬错误。故 `SPECULO_IMPL` 注入的 `get_class()` 用注解排除（见 §10.1），避免把整个
-   `Class` 的签名闭包拖进来；直接 `class_of<crab_cpp::Option<Object>>()` 仍会失败。用户应只反射自己的类型。
+7. **`std` 类型浅物化**：声明在命名空间 `std`（含 `std::__cxx11` 等内联命名空间）里的类、联合、枚举只保留身份和值操作（名字、大小、对齐、拷贝/析构/赋值，以及 `Object` 装箱所需的 thunk），**不枚举**其字段、方法、构造函数、基类、枚举项。用户类型里的 `std::string` 字段、以及签名用到 `std::` 类型的成员函数，仍然正常反射、可 `get` / `set` / `get_ref` / `invoke`；只是不能再通过 `class_of<std::string>()` 去调用 `size()` 这类标准库成员。这是为了避免一个 `std::string` 成员把 `basic_string` 的整棵签名闭包编进程序。**第三方库（包括 speculo 依赖的 `crab_cpp`）不在此列**：它们对 speculo 只是普通外部类型，一律深物化。
+8. **深物化的类型仍可能不可物化**：物化会为每个成员函数生成 invoker（`extract` 成员指针），这会实例化其函数体。若某个用 `= default` 声明的拷贝 / 移动赋值，其默认定义实际是 deleted（类里有 move-only 载荷），GCC 16.2 在 `std::meta::is_deleted` 查询里会直接实例化它并硬报错。speculo 因此先用 `std::is_copy_assignable_v` / `is_move_assignable_v` 判断（`assignment_is_available`），不可调用的赋值运算符仍列出、标 `DELETED`、无 thunk。`crab_cpp` 0.4.1 起它自己的 `Option` / `Result` 也按同一思路把拷贝赋值拆成 default / delete，`Result<const T&, const E&>` 也不再实例化非法的 `std::variant`，所以这些类型可以深物化。`SPECULO_IMPL` 注入的 `get_class()` 继续用注解排除（见 §10.1），避免把整个 `Class` 的签名闭包拖进来。
 9. **自由函数是点名入口，不挂在 `Class` 上**。`function_of<f>()` 物化用户点名的那一个非成员函数；
    重载用 `function_of<overload_of<形参...>(f)>()` 消歧。不枚举命名空间，不做 ADL，不补默认实参，
    不反射函数模板本身（点名一个具体特化可以）。`function_of<^^f>()` 与 `function_of<f>()` 是同一个函数。

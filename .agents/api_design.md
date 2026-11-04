@@ -916,7 +916,8 @@ public:
 
 ## 14. `std` 深物化白名单
 
-v1 的浅物化是硬断点：`class_of<std::string>()` 是空壳，用户第一天就会撞上。
+v1 的浅物化是硬断点：`class_of<std::string>()` 是空壳，用户第一天就会撞上。浅物化只覆盖
+命名空间 `std`；三方库（包括 speculo 依赖的 `crab_cpp`）默认就是深物化，不需要白名单。
 
 ```cpp
 #include <speculo/macros.h>
@@ -931,6 +932,7 @@ SPECULO_DEEP(std::string);
 - 默认不变（`std` 仍是浅物化），避免一个字段把整棵 `basic_string` 签名闭包编进来。
 - 宏触发一次 `detail::deep_materialize<T>()`，把该特化的字段/方法/构造/基类**按用户类型规则**
   物化；不传播到成员类型（`std::vector<int>` 的元素类型仍是浅的，除非也标注）。
+- 三方库类型不需要这个宏：`class_of<crab_cpp::Option<T>>()` / `Result<T, E>` 默认就带成员表。
 - 重复标注幂等；`SPECULO_DEEP` 与 `class_of<T>()` 首次调用都可作为激活点。
 - 代价可观测：`get_size()` 不变，成员表变大；编译期爆炸由 design §17 的成员上限诊断兜底。
 - **可见性要求（实现限制）**：宏展开为该类型的变量模板显式特化。它必须出现在

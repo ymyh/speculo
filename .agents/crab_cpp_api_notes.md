@@ -1,15 +1,32 @@
 # crab_cpp 依赖：API 偏差与升级适配清单
 
-> speculo 依赖 `crab_cpp`。**2026-10-15 已从 v0.3.0 升到 v0.4.0**（`v0.4.0` tag，commit `6503c47`，见其 `CHANGELOG.md`）。
-> 本文记录：v0.3.0 时针对 `Option`/`Result` 记录的偏差、v0.4.0 的解决情况、为适配所做的改动，以及仍然遗留的约束。
+> speculo 依赖 `crab_cpp`。**2026-11-04 已从 v0.4.0 升到 v0.4.1**（`v0.4.1` tag，commit `dadea50`，见其 `CHANGELOG.md`）。
+> 本文记录：v0.3.0 时针对 `Option`/`Result` 记录的偏差、v0.4.0 / v0.4.1 的解决情况、为适配所做的改动，以及仍然遗留的约束。
 > crab_cpp 源码在 `D:/programming/C++/crab-cpp`。
 
-## 0. 依赖 pin（已更新）
+## 0. 依赖 pin
 
-- `CMakeLists.txt`：`FetchContent_Declare(crab_cpp ... GIT_TAG v0.4.0)`（原 v0.3.0）。
-- `xmake.lua`：`package("crab_cpp")` 的 `add_versions("0.4.0", "403e1b94c7a1d2133ba37272031b19facc752a60fecb833482152d3a17869885")`
-  + `add_versions("git:0.4.0", "v0.4.0")`（原 0.3.0）。
-- 本地开发仍用 `-DFETCHCONTENT_SOURCE_DIR_CRAB_CPP=D:/programming/C++/crab-cpp`（xmake 走 package 源）。
+- `CMakeLists.txt`：`FetchContent_Declare(crab_cpp ... GIT_TAG v0.4.1)`（原 v0.4.0）。
+- `xmake.lua`：`package("crab_cpp")` 的 `add_versions("0.4.1", "9eedf011d82932b22c3e8eb32b8c6a4f81ab5a4c9e772b6d3c1c4eadabd5522a")`
+  + `add_versions("git:0.4.1", "v0.4.1")`（原 0.4.0）。
+- 本地开发可用 `-DFETCHCONTENT_SOURCE_DIR_CRAB_CPP=D:/programming/C++/crab-cpp`；xmake 走 package 源
+  （包缓存里换版本后会自动重新安装）。仓库默认不再是本地路径。
+
+## 0.1 v0.4.1：两个「深物化就会硬错误」的表示问题 —— ✅ 已解决
+
+speculo 以前对 `crab_cpp` 也做浅物化，就是为了绕开下面两处；0.4.1 修好后，`crab_cpp` 与其它三方库一样默认深物化。
+
+1. **`Option<move-only T>` / `Result<move-only T, E>` 的默认拷贝赋值**：`operator=(const&) = default` 的隐式定义
+   因载荷只能移动而被定义成 deleted，而 GCC 16.2 的 `std::meta::is_deleted` 会**实例化那份定义**才回答，
+   于是硬报错。0.4.1 把拷贝赋值按 `std::is_copy_assignable_v<存储>` 拆成 `= default` / `= delete` 两个受约束重载。
+   speculo 侧仍保留 `assignment_is_available` 守卫：用户自己的「move-only 载荷 + `= default` 拷贝赋值」还需要它。
+2. **`Result<const T&, const E&>`（`as_ref()` 的返回类型）**：`result_storage` 里的 `value_repr` 持有
+   `std::variant<T, E>`，引用载荷下这个 variant 不合法（引用不是 object type）；而反射判断嵌套类型
+   「是否完整」时必须实例化它。0.4.1 把存储拆成 `result_repr<false, T, E>`（variant）与
+   `result_repr<true, T, E>`（指针 + optional），引用载荷不再碰到 variant。
+
+验证：`class_of<crab_cpp::Option<Object>>()` / `Result<Object, Error>` / `Result<const Object&, const Error&>`
+都有成员表（测试见 `tests/std_library_test.cpp` 的 `StdLibraryTest.ThirdPartyTypesAreDeep`）。
 
 ## 1. `unwrap` / `expect` / `unwrap_err` 的值类别 —— ✅ 0.4.0 已解决
 
@@ -48,14 +65,18 @@
   `class_of<speculo::Class>()`、`class_of<crab_cpp::Option<Object>>()`、`class_of<crab_cpp::Result<Object,Error>>()`
   仍会在 `result.cppm:143` / `option.cppm:142/355` / `object.cppm:2307`
   （invoker 里 `new R(lvalue)` 对返回 `Option<Object>&` 之类的方法拷贝 move-only）处硬错误。
+- **v0.4.1**：上述三处现在都能物化了——`class_of<speculo::Class>()` / `ObjectRef` / `Annotation` 有成员表，
+  `Option<Object>` / `Result<Object, Error>` / `Result<const Object&, const Error&>` 同样有（见 §0.1）。
+  speculo 也不再对 `crab_cpp` 做浅物化。
 - **结论**：`[[= detail::reflect_impl_tag{}]]` 注解（`src/object.cppm` + `include/speculo/macros.h`）
   **继续保留且必要**——它把 `SPECULO_IMPL` 注入的 `get_class()` 排除出成员表，避免把 `Class` 的签名闭包拖进来。
   语义上也成立：桥接方法不应出现在 `get_methods()`。
 
-## 4. 升级验证状态
+## 4. 升级验证状态（v0.4.1）
 
-- ✅ **CMake**：`cmake --build build` 通过；`ctest` 5/5（gtest 75/75 + 4 个示例）。
-- ✅ **xmake**：`add_versions("0.4.0", ...)` 已配；`xmake build speculo_test` / `xmake test` 待确认（首次会重新拉取并编译 0.4.0 包，较慢）。
+- ✅ **CMake**：删掉本地源覆盖后重新 configure，`FetchContent` 拉到 `v0.4.1`（commit `dadea50`）；
+  `cmake --build build` 通过，`ctest` 7/7、`speculo_test` 413 用例全绿。
+- ✅ **xmake**：包缓存里装出 `crab_cpp/0.4.1`；`xmake` 通过（228s），`xmake test` 7/7。
 
 ## 5. 其它（0.4.0 带来的可用改进）
 

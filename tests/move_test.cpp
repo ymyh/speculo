@@ -127,6 +127,22 @@ struct Other
     int value = 0;
 };
 
+// A move-only payload with a *defaulted* copy assignment: its definition is
+// deleted, but GCC 16.2 does not report that through std::meta::is_deleted (it
+// instantiates the definition and fails). speculo asks the assignment traits
+// first, so the class stays materializable and the member is flagged deleted.
+struct MoveOnlyDefaulted
+{
+    std::unique_ptr<int> payload;
+
+    MoveOnlyDefaulted() = default;
+    explicit MoveOnlyDefaulted(int value) : payload(std::make_unique<int>(value)) {}
+
+    MoveOnlyDefaulted(MoveOnlyDefaulted&&) = default;
+    auto operator=(MoveOnlyDefaulted&&) -> MoveOnlyDefaulted& = default;
+    auto operator=(const MoveOnlyDefaulted&) -> MoveOnlyDefaulted& = default; // deleted
+};
+
 struct NoDtor
 {
     int value = 0;
@@ -648,6 +664,45 @@ TEST(MoveTest, MoveFromMatrix)
             EXPECT_EQ(source.as<Tracked>().unwrap().value, -1);
         }
     }
+}
+
+TEST(MoveTest, DefaultedCopyAssignmentWithMoveOnlyPayloadStaysReflectable)
+{
+    const speculo::Class& cls = speculo::class_of<MoveOnlyDefaulted>();
+
+    // Both assignment operators are user-declared, so both are listed; the copy
+    // one is deleted (its default definition is ill-formed) and carries no thunks,
+    // instead of making the whole class unmaterializable.
+    ASSERT_EQ(cls.get_methods().size(), 2u);
+
+    std::size_t deleted = 0;
+    std::size_t movable = 0;
+    for (const speculo::Method& method : cls.get_methods())
+    {
+        ASSERT_EQ(method.get_parameter_types().size(), 1u);
+        if (method.is_deleted())
+        {
+            ++deleted;
+            EXPECT_EQ(method.get_parameter_types()[0], &speculo::class_of<const MoveOnlyDefaulted&>());
+            EXPECT_FALSE(method.is_invokable());
+            EXPECT_FALSE(method.is_ref_invokable());
+            continue;
+        }
+
+        EXPECT_TRUE(method.is_ref_invokable());
+        ++movable;
+    }
+
+    EXPECT_EQ(deleted, 1u);
+    EXPECT_EQ(movable, 1u);
+
+    // Copying through the class is refused; moving still works.
+    MoveOnlyDefaulted target;
+    MoveOnlyDefaulted source{ 7 };
+    EXPECT_EQ(cls.assign(target, source).unwrap_err().kind, speculo::ErrorKind::NotSupported);
+    ASSERT_TRUE(cls.assign(target, speculo::ObjectRef(source).as_rvalue()).is_ok());
+    ASSERT_NE(target.payload, nullptr);
+    EXPECT_EQ(*target.payload, 7);
 }
 
 } // namespace

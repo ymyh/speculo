@@ -32,7 +32,7 @@ include(FetchContent)
 FetchContent_Declare(
     crab_cpp
     GIT_REPOSITORY https://github.com/ymyh/crab-cpp.git
-    GIT_TAG v0.4.0
+    GIT_TAG v0.4.1
     GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(crab_cpp)

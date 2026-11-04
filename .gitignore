@@ -11,6 +11,9 @@ out/
 *.user
 *.suo
 
+# Local tooling state (code-graph index). Not part of the library.
+.codegraph/
+
 # Compiler and linker output, including spike binaries and anything
 # dropped in the repository root by a one-off compile.
 *.exe

@@ -65,8 +65,9 @@ struct reflect_impl_tag
 /**
  * @brief Opt-in flag set by SPECULO_DEEP(T) (api_design §14)
  *
- * Standard-library types are materialized shallowly by default: names, size and
- * the value operations an Object needs, but no member tables. `SPECULO_DEEP(T)`
+ * Standard-library types (namespace `std`) are materialized shallowly by
+ * default: names, size and the value operations an Object needs, but no member
+ * tables. `SPECULO_DEEP(T)`
  * specializes this variable template for one specialization, which makes the
  * collectors treat that type like a user type.
  *
@@ -113,7 +114,7 @@ consteval auto is_unqualified_class(meta::info C) -> bool
 }
 
 // Whether the entity is declared (at any depth) inside namespace std.
-consteval auto is_in_std_namespace(meta::info entity) -> bool
+consteval auto is_in_shallow_namespace(meta::info entity) -> bool
 {
     for (meta::info scope = meta::parent_of(entity); scope != ^^::; scope = meta::parent_of(scope))
     {
@@ -135,15 +136,18 @@ consteval auto is_in_std_namespace(meta::info entity) -> bool
  * program. A user type that *has* a `std::` member, or a function whose
  * signature *uses* a `std::` type, still reflects that member or function;
  * only the standard type itself is not expanded.
+ *
+ * Third-party libraries are not covered: `crab_cpp::Option` / `Result` are
+ * ordinary deep types, even though speculo depends on them.
  */
-consteval auto is_std_type(meta::info type) -> bool
+consteval auto is_shallow_type(meta::info type) -> bool
 {
     if (!meta::has_parent(type))
     {
         return false;
     }
 
-    return is_in_std_namespace(type);
+    return is_in_shallow_namespace(type);
 }
 
 /**
@@ -170,7 +174,7 @@ consteval auto is_deep_type() -> bool
 template<meta::info C>
 consteval auto expandable_type() -> bool
 {
-    return is_unqualified_class(C) && (!is_std_type(C) || is_deep_type<C>());
+    return is_unqualified_class(C) && (!is_shallow_type(C) || is_deep_type<C>());
 }
 
 /**
@@ -221,7 +225,7 @@ consteval auto is_reflectable_method(meta::info member) -> bool
     // library types are implementation detail and may be ill-formed for a given
     // instantiation (tuple's const _M_swap), which would be a hard error inside
     // class_of<T>() of any type holding e.g. a std::unique_ptr. Never touch them.
-    if (!meta::is_public(member) && is_in_std_namespace(meta::parent_of(member)))
+    if (!meta::is_public(member) && is_in_shallow_namespace(meta::parent_of(member)))
     {
         return false;
     }
